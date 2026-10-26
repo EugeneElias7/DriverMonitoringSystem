@@ -1,0 +1,3 @@
+cigarette
+person
+smoke

@@ -1,0 +1,120 @@
+# Default configuration for the offline driver-monitoring research prototype.
+# Paths are resolved relative to the repository root.
+project:
+  name: dms-offline
+  output_dir: results
+
+face:
+  model_path: models/face_landmarks/face_landmarker.task
+  # auto -> IMAGE for still images, VIDEO for video/webcam (set by the CLI).
+  mode: auto
+  num_faces: 1
+  min_detection_confidence: 0.5
+  min_presence_confidence: 0.5
+  min_tracking_confidence: 0.5
+  # Retry with an upscaled crop when the face is small in the full frame.
+  auto_roi_retry: true
+  roi_min_side: 512
+  roi_padding: 0.15
+  # Optional explicit region of interest in the source frame: [x1, y1, x2, y2].
+  roi: null
+  compute_pnp_fallback: true
+  smoothing_alpha: 0.45
+  model_sha256: 64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff
+
+drowsiness:
+  # EAR is aggregated with max(left, right) for closure logic. The initial
+  # baseline is deliberately conservative; it adapts upward when eyes are open.
+  ear_baseline_initial: 0.26
+  ear_baseline_min: 0.18
+  ear_baseline_max: 0.42
+  ear_adapt_alpha: 0.01
+  # First 30 open, roughly frontal samples adapt quickly to the current user.
+  calibration_samples: 30
+  calibration_alpha: 0.05
+  closed_ratio: 0.70
+  open_ratio: 0.82
+  # Eye geometry is not trusted beyond these head angles.
+  max_yaw_deg: 55.0
+  max_pitch_deg: 40.0
+  # When the head is pitched down, eye apertures shrink geometrically.
+  # Require a stricter threshold before calling the eyes closed.
+  pitch_guard_deg: 25.0
+  guarded_closed_ratio: 0.55
+  blink_max_ms: 500
+  prolonged_ms: 900
+  microsleep_ms: 1500
+  yawn_mar: 0.55
+  yawn_min_ms: 400
+  perclos_window_ms: 60000
+  perclos_min_window_ms: 10000
+  perclos_drowsy: 0.30
+  face_loss_grace_ms: 600
+  face_lost_event_ms: 1500
+  recent_microsleep_ms: 30000
+  use_blendshapes: false
+  event_cooldown_ms: 3000
+
+head_pose:
+  yaw_threshold_deg: 15.0
+  pitch_threshold_deg: 15.0
+  smoothing_alpha: 0.45
+  # MediaPipe's transform matrix yaw sign is image-left positive in our tests.
+  yaw_positive_label: left
+  event_cooldown_ms: 3000
+
+distraction:
+  yaw_threshold_deg: 25.0
+  pitch_down_threshold_deg: 30.0
+  pitch_up_threshold_deg: 30.0
+  glance_max_ms: 700
+  # The first 1.2 s of a lateral glance is tolerated as a possible mirror check.
+  mirror_glance_max_ms: 1200
+  distraction_hold_ms: 1500
+  face_loss_reset_ms: 500
+  event_cooldown_ms: 3000
+
+smoking:
+  # yolo_onnx | tflite_ssd | none
+  backend: yolo_onnx
+  model_path: models/candidates/smoking/leviathan_cgr.onnx
+  class_names: [cigarette]
+  input_size: 640
+  confidence_threshold: 0.25
+  class_thresholds:
+    cigarette: 0.25
+  nms_iou: 0.45
+  expected_target_class: cigarette
+  trigger_classes: [cigarette]
+  # Smoke is not evidence of a cigarette near the mouth on its own.
+  non_trigger_classes: [smoke]
+  mask_classes: [person]
+  mouth_distance_face_width: 0.65
+  max_target_face_area_ratio: 0.50
+  confirmation_ms: 900
+  miss_tolerance_ms: 600
+  min_hits: 2
+  inference_interval: 1
+  stale_after_ms: 250
+  event_cooldown_ms: 3000
+  tflite_model_path: models/smoking/detect.tflite
+  tflite_labelmap_path: models/smoking/labelmap.txt
+  tflite_labelmap_offset: 0
+  tflite_input_range: unit
+  tflite_score_threshold: 0.30
+  known_tflite_issue: true
+
+pipeline:
+  process_every_n_frames: 1
+  resize_width: 0
+  save_annotated: true
+  save_events_jsonl: true
+  events_jsonl: results/events.jsonl
+  output_dir: results
+  face_every_n_frames: 1
+
+video:
+  fps_fallback: 30.0
+
+events:
+  cooldown_ms: 3000

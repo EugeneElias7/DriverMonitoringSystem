@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dms-offline"
+version = "0.1.0"
+description = "Modular offline driver-monitoring research prototype"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "mediapipe>=0.10.14",
+  "onnxruntime>=1.17",
+  "PyYAML>=6.0",
+  "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+tflite = ["tensorflow>=2.16"]
+pi = ["ai-edge-litert>=2.1; platform_machine=='aarch64'", "tflite-runtime>=2.14; platform_machine=='armv7l'"]
+
+[project.scripts]
+dms = "dms.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: requires model weights or a real model runtime",
+  "slow: takes more than a few seconds",
+]
+addopts = "-ra"
