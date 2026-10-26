@@ -1,0 +1,16 @@
+# Pi 3 DMS core - Python 3.9+ / 64-bit Raspberry Pi OS recommended.
+#
+# One model is used: models/face_landmarker.task.
+# Do not add torch, ultralytics or a generic COCO model to the Pi 3 package.
+#
+# The resolver is deliberately not pinned to old NumPy/OpenCV releases:
+# current MediaPipe builds on desktop Python 3.13 and older MediaPipe builds
+# on Raspberry Pi OS can then choose compatible wheels.
+flask>=3,<4
+numpy>=1.24
+opencv-contrib-python>=4.8
+mediapipe>=0.10.14
+
+# Picamera2 is normally installed with Raspberry Pi OS:
+#   sudo apt install -y python3-picamera2 libcamera-apps
+# If you use a USB camera through OpenCV, Picamera2 is not required.

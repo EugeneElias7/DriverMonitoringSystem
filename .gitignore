@@ -1,0 +1,13 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local OS noise
+.DS_Store
+Thumbs.db
+
+# Local logs and snapshots
+*.log
+camera-test.jpg
