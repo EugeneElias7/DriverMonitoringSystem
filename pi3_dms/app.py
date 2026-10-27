@@ -1,14 +1,10 @@
-"""Raspberry Pi 3 DMS core: face, eyes, mouth and head orientation.
+"""Raspberry Pi 3 DMS application.
 
-This file is intentionally self-contained. It needs exactly one model:
-``models/face_landmarker.task``.
+The face core lives in :mod:`dms.core` and is always independent.  The optional
+object/behaviour module lives in :mod:`dms.objects` and :mod:`dms.fusion`; it is
+disabled by default and cannot prevent the face core from starting.
 
-It runs on a laptop webcam for development and on a Pi 3 with a CSI camera
-through Picamera2. The camera may be a 1080p module: the sensor stream is
-downscaled to a small inference frame while the browser stream stays large
-enough for crisp overlay text.
-
-This is a research/demo application, not a safety or medical device.
+The web dashboard is a research/demo interface, not a safety or medical device.
 """
 
 from __future__ import annotations
@@ -17,13 +13,11 @@ import argparse
 import atexit
 import json
 import math
-import statistics
 import sys
 import threading
 import time
 import webbrowser
 from collections import deque
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,19 +26,31 @@ import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, request
 
+from dms.camera import CameraWorker, FrameStore, preprocess_frame
+from dms.core import (
+    LEFT_EYE,
+    MOUTH_BOTTOM,
+    MOUTH_LEFT,
+    MOUTH_RIGHT,
+    MOUTH_TOP,
+    NOSE_TIP,
+    RIGHT_EYE,
+    FaceObservation,
+    FaceModel,
+    MeasurementEngine,
+)
+from dms.fusion import BehaviourConfig, FusionEngine
+from dms.objects import (
+    CANONICAL_LABELS,
+    ObjectSnapshot,
+    ObjectWorker,
+    build_object_detector,
+)
+from dms.resources import ResourceMonitor
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = BASE_DIR / "models" / "face_landmarker.task"
-
-# MediaPipe Face Mesh indices.
-LEFT_EYE = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-MOUTH_TOP = 13
-MOUTH_BOTTOM = 14
-MOUTH_LEFT = 61
-MOUTH_RIGHT = 291
-FACE_LEFT = 33
-FACE_RIGHT = 263
-NOSE_TIP = 1
+DEFAULT_OBJECT_MODEL = BASE_DIR / "models" / "object" / "efficientdet_lite0.tflite"
 
 # Colours are BGR.
 GREEN = (90, 220, 105)
@@ -53,7 +59,6 @@ ORANGE = (35, 150, 245)
 RED = (60, 60, 235)
 CYAN = (220, 210, 60)
 WHITE = (245, 245, 245)
-DARK = (13, 18, 23)
 MUTED = (165, 180, 195)
 
 HTML = """<!doctype html>
@@ -61,7 +66,7 @@ HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pi 3 DMS - Core</title>
+<title>Pi 3 DMS</title>
 <style>
   :root { color-scheme:dark; --bg:#0b1117; --panel:#141e28; --line:#2a3a49;
           --text:#edf4f9; --muted:#98a9b8; --good:#58d68d; --warn:#ffc857;
@@ -69,22 +74,22 @@ HTML = """<!doctype html>
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text);
          font:14px/1.45 "Segoe UI", system-ui, sans-serif; }
-  header { display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+  header { display:flex; gap:9px; align-items:center; flex-wrap:wrap;
            padding:12px 16px; border-bottom:1px solid var(--line); }
   header h1 { font-size:19px; margin:0; letter-spacing:.2px; }
   .pill { border:1px solid var(--line); border-radius:999px; padding:3px 9px;
-          font-size:12px; color:var(--muted); }
+          font-size:12px; color:var(--muted); white-space:nowrap; }
   .pill.good { color:var(--good); border-color:#2b6b46; }
   .pill.warn { color:var(--warn); border-color:#725d2b; }
   .pill.bad { color:var(--bad); border-color:#7a3535; }
   main { max-width:1600px; margin:auto; padding:14px; display:grid;
-         grid-template-columns:minmax(0,1.7fr) minmax(330px,1fr); gap:14px; }
+         grid-template-columns:minmax(0,1.7fr) minmax(340px,1fr); gap:14px; }
   .video { background:#000; border:1px solid var(--line); border-radius:12px;
            overflow:hidden; display:flex; align-items:center; }
   .video img { width:100%; height:auto; display:block; }
-  .side { display:flex; flex-direction:column; gap:9px; }
+  .side { display:flex; flex-direction:column; gap:9px; min-width:0; }
   .card { background:var(--panel); border:1px solid var(--line);
-          border-radius:11px; padding:11px 13px; }
+          border-radius:11px; padding:11px 13px; min-width:0; }
   .card h2 { margin:0 0 6px; color:var(--muted); font-size:11px;
              letter-spacing:.10em; text-transform:uppercase; }
   .big { font-size:25px; line-height:1.2; font-weight:700; }
@@ -97,9 +102,25 @@ HTML = """<!doctype html>
          font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
   .row b { color:var(--text); font-weight:600; }
   .good { color:var(--good); } .warn { color:var(--warn); }
-  .bad { color:var(--bad); }
+  .bad { color:var(--bad); } .muted { color:var(--muted); }
   .note { font-size:12px; color:var(--muted); }
   .event { border-left:3px solid var(--warn); padding-left:8px; }
+  .event-item { font-size:12px; color:var(--muted); padding:2px 0; }
+  .event-item b { color:var(--text); font-weight:600; }
+  .event-item.behaviour { border-left:2px solid var(--accent); padding-left:6px; }
+  .detection-list { display:flex; flex-direction:column; gap:5px; }
+  .detection { display:flex; justify-content:space-between; gap:8px;
+               border-left:3px solid var(--accent); padding-left:7px;
+               font-size:12px; color:var(--muted); }
+  .detection b { color:var(--text); }
+  .behaviour { border:1px solid var(--line); border-radius:8px; padding:7px 8px;
+               margin-top:5px; }
+  .behaviour-head { display:flex; justify-content:space-between; gap:8px;
+                    align-items:center; font-size:13px; }
+  .behaviour-head b { font-weight:700; }
+  .behaviour .note { margin-top:3px; }
+  .raw-link { color:var(--accent); text-decoration:none; font-size:12px; }
+  .raw-link:hover { text-decoration:underline; }
   footer { max-width:1600px; margin:auto; padding:2px 16px 22px;
            color:var(--muted); font-size:11px; }
   @media (max-width:900px) { main { grid-template-columns:1fr; } }
@@ -107,19 +128,24 @@ HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <h1>Pi 3 DMS - Core</h1>
+  <h1>Pi 3 DMS</h1>
   <span class="pill" id="mode">starting...</span>
   <span class="pill" id="camera">camera</span>
-  <span class="note">face + eyes + mouth + head orientation; one model</span>
+  <span class="pill" id="object_pill">objects disabled</span>
+  <span class="note">face core always on; object/behaviour module optional</span>
 </header>
 <main>
   <section class="video"><img src="/video_feed" alt="annotated camera"></section>
   <section class="side">
     <div class="card">
-      <h2>Driver state</h2>
+      <h2>Driver state (display priority)</h2>
       <div class="big" id="main_state">Starting...</div>
       <div class="reason" id="main_reason">Loading the face model.</div>
       <div style="margin-top:7px"><span class="pill" id="tracking">tracking uncertain</span></div>
+      <div class="metrics" style="margin-top:7px">
+        <span>Tracking confidence</span><b id="tracking_confidence">-</b>
+        <span>Confidence source</span><b id="tracking_basis">heuristic, not a model probability</b>
+      </div>
     </div>
     <div class="grid2">
       <div class="card">
@@ -148,48 +174,133 @@ HTML = """<!doctype html>
       </div>
     </div>
     <div class="card">
-      <h2>Fatigue index (measurement only)</h2>
+      <h2>Independent core states</h2>
+      <div class="row"><span>Drowsiness</span><b id="drowsiness">-</b></div>
+      <div class="row"><span>Attention</span><b id="attention">-</b></div>
+      <div class="row"><span>Yawning</span><b id="yawning">-</b></div>
       <div class="row"><span>PERCLOS, 60 s</span><b id="perclos">-</b></div>
       <div class="row"><span>Window</span><b id="perclos_window">-</b></div>
-      <div class="note">Shown separately. DROWSY is only raised for a current sustained closure.</div>
+      <div class="note" style="margin-top:5px">DROWSY is raised only by a current sustained closure. PERCLOS is shown separately.</div>
     </div>
     <div class="card">
-      <h2>Performance</h2>
+      <h2>Object detections <span class="muted">(detector output, not behaviour)</span></h2>
+      <div class="row"><span>Module</span><b id="object_status">-</b></div>
+      <div class="row"><span>Model</span><b id="object_model">-</b></div>
+      <div class="row"><span>Allowed classes</span><b id="object_classes">-</b></div>
+      <div class="row"><span>Inference latency</span><b id="object_latency">-</b></div>
+      <div class="row"><span>Detections age</span><b id="object_age">-</b></div>
+      <div class="detection-list" id="detections" style="margin-top:7px">
+        <div class="note">No active detections.</div>
+      </div>
+      <div class="note" id="object_error" style="margin-top:6px"></div>
+      <div style="margin-top:6px"><a class="raw-link" id="raw_link" href="/snapshot_raw.jpg" target="_blank" rel="noreferrer">Open unannotated raw frame for debugging</a></div>
+      <div class="note" style="margin-top:5px">Detector confidence is not evidence of behaviour. A bottle is never relabelled as a cigarette.</div>
+    </div>
+    <div class="card">
+      <h2>Behaviour evidence <span class="muted">(suspected, not proof)</span></h2>
+      <div class="behaviour" id="beh_phone">
+        <div class="behaviour-head"><span>Phone use</span><b class="muted">-</b></div>
+        <div class="note"></div>
+      </div>
+      <div class="behaviour" id="beh_drinking">
+        <div class="behaviour-head"><span>Drinking</span><b class="muted">-</b></div>
+        <div class="note"></div>
+      </div>
+      <div class="behaviour" id="beh_smoking">
+        <div class="behaviour-head"><span>Smoking</span><b class="muted">-</b></div>
+        <div class="note"></div>
+      </div>
+      <div class="note" style="margin-top:5px">A suspected behaviour requires a matching detector label, face/mouth proximity, persistence, and enough observations. Face loss or stale detections clear the evidence.</div>
+    </div>
+    <div class="card">
+      <h2>Performance / resources</h2>
       <div class="row"><span>Processed FPS</span><b id="fps">-</b></div>
       <div class="row"><span>Process latency</span><b id="latency">-</b></div>
       <div class="row"><span>Capture-to-process age</span><b id="age">-</b></div>
       <div class="row"><span>Camera</span><b id="camera_detail">-</b></div>
+      <div class="row"><span>Face model</span><b id="face_model">-</b></div>
       <div class="row"><span>Stream / inference</span><b id="resolution">-</b></div>
-      <div class="row"><span>Purple / night</span><b id="tint">-</b></div>
+      <div class="row"><span>Colour preprocessing</span><b id="tint">-</b></div>
+      <div class="row"><span>Camera AWB / controls</span><b id="awb">-</b></div>
+      <div class="row"><span>CPU</span><b id="cpu">-</b></div>
+      <div class="row"><span>Process CPU</span><b id="process_cpu">-</b></div>
+      <div class="row"><span>RAM</span><b id="ram">-</b></div>
+      <div class="row"><span>Temperature</span><b id="temperature">-</b></div>
     </div>
     <div class="card">
-      <h2>Latest event</h2>
-      <div class="event reason" id="event">No event yet.</div>
+      <h2>Recent events</h2>
+      <div id="events" class="note">No event yet.</div>
     </div>
     <div class="card">
-      <h2>Pi 3 scope</h2>
-      <div class="note">
-        This build runs the face/eye/mouth/head core only. Smoking, phone and
-        drinking models are not run on the Pi 3 because they are too heavy for
-        real-time use and are not validated DMS classes.
+      <h2>Scope / unavailable</h2>
+      <div class="note" id="scope">
+        Alcohol is unavailable: video cannot measure breath alcohol. A physical sensor is required.
+        Object detection is optional and experimental; the shipped COCO control model has no cigarette class.
       </div>
     </div>
   </section>
 </main>
 <footer>
-  Research prototype. Not a safety device. No accuracy, precision, recall or
-  fatigue-diagnosis claim is made from unlabelled camera video. Keep faces and
-  recordings local and obtain consent.
+  Research prototype. Not a safety device. No accuracy, precision, recall or fatigue-diagnosis claim
+  is made from unlabelled camera video. Keep faces and recordings local and obtain consent.
 </footer>
 <script>
 const $ = (id) => document.getElementById(id);
-const n = (v) => (v === null || v === undefined || Number.isNaN(Number(v))) ? "-" : Number(v);
-const f = (v, d=1, suffix="") => (v === null || v === undefined || Number.isNaN(Number(v))) ? "-" : Number(v).toFixed(d) + suffix;
-function setState(el, value) {
-  el.textContent = value;
-  const bad = ["DROWSY", "DISTRACTED"];
-  const warn = ["EYES CLOSED", "YAWNING", "GLANCE", "TRACKING UNCERTAIN"];
-  el.className = "big " + (bad.includes(value) ? "bad" : (warn.includes(value) ? "warn" : "good"));
+const isNum = (v) => v !== null && v !== undefined && !Number.isNaN(Number(v));
+const n = (v) => isNum(v) ? Number(v) : "-";
+const f = (v, d=1, suffix="") => isNum(v) ? Number(v).toFixed(d) + suffix : "-";
+const pct = (v) => isNum(v) ? f(Number(v) * 100, 1, "%") : "-";
+const pillClass = (value) => {
+  if (["suspected", "DROWSY", "DISTRACTED", "error"].includes(value)) return "bad";
+  if (["possible", "EYES CLOSED", "YAWNING", "GLANCE", "TRACKING UNCERTAIN",
+       "uncertain", "stale", "unavailable", "starting"].includes(value)) return "warn";
+  if (["clear", "running", "ATTENTIVE", "disabled"].includes(value)) return "good";
+  return "";
+};
+const setState = (el, value) => {
+  el.textContent = value || "-";
+  el.className = "big " + pillClass(value);
+};
+const setRow = (id, value) => { const el = $(id); if (el) el.textContent = value; };
+const pretty = (value) => (value || "-").replaceAll("_", " ");
+function renderDetections(items) {
+  const box = $("detections");
+  box.replaceChildren();
+  if (!items || !items.length) {
+    const d = document.createElement("div"); d.className = "note";
+    d.textContent = "No active detections."; box.appendChild(d); return;
+  }
+  for (const item of items) {
+    const row = document.createElement("div"); row.className = "detection";
+    const left = document.createElement("span");
+    left.textContent = (item.label || "?") + "  " + f(item.confidence, 2);
+    const right = document.createElement("b");
+    const b = item.bbox || [];
+    right.textContent = b.length === 4 ? "box " + b.map(v => f(v, 2)).join(",") : "";
+    right.title = "normalized bounding box and detector confidence";
+    row.appendChild(left); row.appendChild(right); box.appendChild(row);
+  }
+}
+function renderBehaviour(id, data) {
+  const box = $(id); if (!box) return;
+  const head = box.querySelector(".behaviour-head b");
+  const note = box.querySelector(".note");
+  const state = data && data.state ? data.state : "unavailable";
+  head.textContent = pretty(state); head.className = pillClass(state);
+  note.textContent = (data && data.evidence) ? data.evidence : "No evidence.";
+}
+function renderEvents(events) {
+  const box = $("events"); box.replaceChildren();
+  if (!events || !events.length) {
+    const d = document.createElement("div"); d.textContent = "No event yet."; box.appendChild(d); return;
+  }
+  for (const item of events) {
+    const d = document.createElement("div");
+    d.className = "event-item " + (item.kind === "behaviour" ? "behaviour" : "");
+    const b = document.createElement("b"); b.textContent = item.time + "  ";
+    d.appendChild(b); d.appendChild(document.createTextNode((item.label || "") + ": " + (item.detail || "")));
+    box.appendChild(d);
+  }
 }
 async function refresh() {
   try {
@@ -201,588 +312,89 @@ async function refresh() {
     const tr = s.tracking || {};
     $("tracking").textContent = "tracking: " + (tr.state || "uncertain") + " - " + (tr.reason || "");
     $("tracking").className = "pill " + (tr.state === "good" ? "good" : "warn");
+    setRow("tracking_confidence", isNum(tr.confidence) ? f(tr.confidence, 2) : "-");
+    setRow("tracking_basis", tr.confidence_basis || "heuristic, not a model probability");
+
     const e = s.eyes || {};
     $("eyes").textContent = e.state || "-";
     $("eyes").className = "big " + (e.state === "closed" ? "warn" : "good");
-    $("ear_raw").textContent = f(e.ear_raw, 3);
-    $("ear_smoothed").textContent = f(e.ear_smoothed, 3);
-    $("threshold").textContent = f(e.threshold, 3);
-    $("closure").textContent = f(e.closure_ms, 0, " ms");
-    $("blinks").textContent = n(s.blinks);
-    $("microsleeps").textContent = n(s.microsleeps);
+    setRow("ear_raw", f(e.ear_raw, 3));
+    setRow("ear_smoothed", f(e.ear_smoothed, 3));
+    setRow("threshold", f(e.threshold, 3));
+    setRow("closure", f(e.closure_ms, 0, " ms"));
+    setRow("blinks", n(s.blinks));
+    setRow("microsleeps", n(s.microsleeps));
+
     const m = s.mouth || {};
     $("mouth").textContent = m.state || "-";
     $("mouth").className = "big " + (m.state === "yawning" ? "warn" : "good");
-    $("mar").textContent = f(m.mar_raw, 2) + " / " + f(m.mar_smoothed, 2);
-    $("yawn_ms").textContent = f(m.open_ms, 0, " ms");
-    $("yawns").textContent = n(s.yawns);
+    setRow("mar", f(m.mar_raw, 2) + " / " + f(m.mar_smoothed, 2));
+    setRow("yawn_ms", f(m.open_ms, 0, " ms"));
+    setRow("yawns", n(s.yawns));
+
     const h = s.head || {};
-    $("head").textContent = h.state || "-";
-    $("pose").textContent = f(h.yaw, 1) + " / " + f(h.pitch, 1) + " / " + f(h.roll, 1);
-    $("away").textContent = f(h.away_ms, 0, " ms");
-    const p = s.fatigue || {};
-    $("perclos").textContent = p.perclos === null || p.perclos === undefined ? "-" : f(p.perclos * 100, 1, "%");
-    $("perclos_window").textContent = f(p.window_s, 0, " s");
+    setRow("head", h.state || "-");
+    setRow("pose", f(h.yaw, 1) + " / " + f(h.pitch, 1) + " / " + f(h.roll, 1));
+    setRow("away", f(h.away_ms, 0, " ms"));
+
+    const ind = s.independent || {};
+    setRow("drowsiness", pretty(ind.drowsiness));
+    setRow("attention", pretty(ind.attention));
+    setRow("yawning", ind.yawning ? "yes" : "no");
+    const pf = s.fatigue || {};
+    setRow("perclos", pf.perclos === null || pf.perclos === undefined ? "-" : pct(pf.perclos));
+    setRow("perclos_window", f(pf.window_s, 0, " s"));
+
+    const obj = s.object || {};
+    const objStatus = obj.status || "disabled";
+    $("object_pill").textContent = "objects: " + objStatus;
+    $("object_pill").className = "pill " + pillClass(objStatus);
+    setRow("object_status", pretty(objStatus));
+    setRow("object_model", obj.model || "-");
+    setRow("object_classes", (obj.classes || []).join(", ") || "-");
+    setRow("object_latency", f(obj.latency_ms, 1, " ms"));
+    setRow("object_age", f(obj.age_ms, 0, " ms"));
+    $("object_error").textContent = obj.error || "";
+    renderDetections(s.detections || []);
+    renderBehaviour("beh_phone", (s.behaviours || {}).phone);
+    renderBehaviour("beh_drinking", (s.behaviours || {}).drinking);
+    renderBehaviour("beh_smoking", (s.behaviours || {}).smoking);
+
     const perf = s.performance || {};
-    $("fps").textContent = f(perf.process_fps, 1);
-    $("latency").textContent = f(perf.process_ms, 1, " ms");
-    $("age").textContent = f(perf.frame_age_ms, 1, " ms");
+    setRow("fps", f(perf.process_fps, 1));
+    setRow("latency", f(perf.process_ms, 1, " ms"));
+    setRow("age", f(perf.frame_age_ms, 1, " ms"));
     const cam = s.camera || {};
     $("camera").textContent = cam.backend || "camera";
-    $("camera_detail").textContent = (cam.capture_resolution || "-") + " @ " + f(cam.capture_fps, 1) + " fps";
-    $("resolution").textContent = (cam.stream_resolution || "-") + " / " + (cam.process_resolution || "-");
-    $("tint").textContent = s.tint || "-";
-    $("event").textContent = s.last_event || "No event yet.";
-    if (s.camera && s.camera.error) {
-      $("camera").className = "pill bad";
-      $("camera").textContent = "camera error";
+    setRow("camera_detail", (cam.capture_resolution || "-") + " @ " + f(cam.capture_fps, 1) + " fps");
+    setRow("face_model", ((s.face_model || {}).name || "-") + " (" + ((s.face_model || {}).status || "?") + ")");
+    setRow("resolution", (cam.stream_resolution || "-") + " / " + (cam.process_resolution || "-"));
+    const pre = s.preprocessing || {};
+    setRow("tint", pre.label || "-");
+    setRow("awb", (pre.awb || "-") + " / " + (pre.camera_controls || "-"));
+    if (cam.error) {
+      $("camera").className = "pill bad"; $("camera").textContent = "camera error";
+    } else {
+      $("camera").className = "pill good";
     }
+
+    const res = s.resources || {};
+    setRow("cpu", isNum(res.cpu_percent) ? f(res.cpu_percent, 1, "%") : "-");
+    setRow("process_cpu", isNum(res.process_cpu_percent) ? f(res.process_cpu_percent, 1, "%") : "-");
+    setRow("ram", isNum(res.ram_percent) ? f(res.ram_percent, 1, "%") : "-");
+    setRow("temperature", isNum(res.temperature_c) ? f(res.temperature_c, 1, " C") : "-");
+
+    renderEvents(s.recent_events || []);
   } catch (err) {
     $("mode").textContent = "server unavailable";
     $("mode").className = "pill bad";
   }
 }
 refresh();
-setInterval(refresh, 300);
+setInterval(refresh, 400);
 </script>
 </body>
 </html>"""
-
-
-# ---------------------------------------------------------------------------
-# Face landmarks and measurements
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class FaceObservation:
-    points: np.ndarray
-    bbox: tuple[float, float, float, float]
-    face_width: float
-    ear_left: float
-    ear_right: float
-    ear: float
-    mar: float
-    mouth_center: tuple[float, float]
-    yaw: float | None
-    pitch: float | None
-    roll: float | None
-    quality: str
-    quality_detail: str
-
-
-def _dist(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.linalg.norm(np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)))
-
-
-def _ear(points: np.ndarray, indices: list[int]) -> float:
-    p = np.asarray(points, dtype=np.float64)[indices]
-    denominator = 2.0 * _dist(p[0], p[3])
-    if denominator <= 1e-6:
-        return 0.0
-    return (_dist(p[1], p[5]) + _dist(p[2], p[4])) / denominator
-
-
-def _mar(points: np.ndarray) -> float:
-    p = np.asarray(points, dtype=np.float64)
-    width = _dist(p[MOUTH_LEFT], p[MOUTH_RIGHT])
-    if width <= 1e-6:
-        return 0.0
-    return _dist(p[MOUTH_TOP], p[MOUTH_BOTTOM]) / width
-
-
-def _rotation_to_euler(rotation: np.ndarray) -> tuple[float, float, float]:
-    r = np.asarray(rotation, dtype=np.float64)
-    sy = math.sqrt(r[0, 0] ** 2 + r[1, 0] ** 2)
-    if sy > 1e-6:
-        pitch = math.atan2(r[2, 1], r[2, 2])
-        yaw = math.atan2(-r[2, 0], sy)
-        roll = math.atan2(r[1, 0], r[0, 0])
-    else:
-        pitch = math.atan2(-r[1, 2], r[1, 1])
-        yaw = math.atan2(-r[2, 0], sy)
-        roll = 0.0
-    return (math.degrees(pitch), math.degrees(yaw), math.degrees(roll))
-
-
-class FaceModel:
-    """MediaPipe Face Landmarker in VIDEO mode."""
-
-    def __init__(
-        self,
-        model_path: Path,
-        *,
-        num_faces: int = 1,
-        min_detection_confidence: float = 0.5,
-        min_tracking_confidence: float = 0.5,
-    ):
-        if not model_path.exists():
-            raise FileNotFoundError(f"face model not found: {model_path}")
-        from mediapipe.tasks import python as mp_python
-        from mediapipe.tasks.python import vision
-
-        self._mp = None
-        self._last_timestamp_ms = -1
-        options = vision.FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=vision.RunningMode.VIDEO,
-            num_faces=int(num_faces),
-            min_face_detection_confidence=float(min_detection_confidence),
-            min_face_presence_confidence=0.5,
-            min_tracking_confidence=float(min_tracking_confidence),
-            output_face_blendshapes=False,
-            output_facial_transformation_matrixes=True,
-        )
-        self._landmarker = vision.FaceLandmarker.create_from_options(options)
-
-    def close(self) -> None:
-        if self._landmarker is not None:
-            self._landmarker.close()
-            self._landmarker = None
-
-    def detect(
-        self,
-        frame_bgr: np.ndarray,
-        timestamp_s: float,
-        *,
-        min_face_width_px: float = 40.0,
-    ) -> FaceObservation | None:
-        if self._mp is None:
-            import mediapipe as mp
-
-            self._mp = mp
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
-        stamp = max(int(timestamp_s * 1000.0), self._last_timestamp_ms + 1)
-        self._last_timestamp_ms = stamp
-        result = self._landmarker.detect_for_video(image, stamp)
-        if not result.face_landmarks:
-            return None
-
-        height, width = frame_bgr.shape[:2]
-        landmarks = result.face_landmarks[0]
-        points = np.asarray(
-            [(float(lm.x) * width, float(lm.y) * height) for lm in landmarks],
-            dtype=np.float32,
-        )
-        if points.shape[0] <= max(RIGHT_EYE):
-            return None
-
-        face_w = _dist(points[FACE_LEFT], points[FACE_RIGHT])
-        x1, y1 = points[:, 0].min(), points[:, 1].min()
-        x2, y2 = points[:, 0].max(), points[:, 1].max()
-        pad_x = max(2.0, (x2 - x1) * 0.03)
-        pad_y = max(2.0, (y2 - y1) * 0.03)
-        bbox = (
-            float(max(0.0, x1 - pad_x)),
-            float(max(0.0, y1 - pad_y)),
-            float(min(float(width), x2 + pad_x)),
-            float(min(float(height), y2 + pad_y)),
-        )
-
-        yaw = pitch = roll = None
-        if result.facial_transformation_matrixes:
-            matrix = np.asarray(result.facial_transformation_matrixes[0], dtype=np.float64)
-            if matrix.shape == (4, 4):
-                pitch, yaw, roll = _rotation_to_euler(matrix[:3, :3])
-
-        ear_left = _ear(points, LEFT_EYE)
-        ear_right = _ear(points, RIGHT_EYE)
-        ear = max(ear_left, ear_right)
-        mar = _mar(points)
-        quality = "good"
-        detail = "face and eye geometry available"
-        if face_w < min_face_width_px:
-            quality = "too_small"
-            detail = "face too small for a precise eye measurement"
-        elif not (0.01 <= ear <= 0.9):
-            quality = "invalid_ear"
-            detail = "eye geometry is not reliable"
-        elif yaw is not None and abs(yaw) > 55.0:
-            quality = "low_yaw"
-            detail = "head turned too far for eye measurement"
-        elif pitch is not None and abs(pitch) > 40.0:
-            quality = "low_pitch"
-            detail = "head angle too steep for eye measurement"
-
-        center = (points[MOUTH_TOP] + points[MOUTH_BOTTOM]) / 2.0
-        return FaceObservation(
-            points=points,
-            bbox=bbox,
-            face_width=face_w,
-            ear_left=ear_left,
-            ear_right=ear_right,
-            ear=ear,
-            mar=mar,
-            mouth_center=(float(center[0]), float(center[1])),
-            yaw=yaw,
-            pitch=pitch,
-            roll=roll,
-            quality=quality,
-            quality_detail=detail,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Drowsiness and head state
-# ---------------------------------------------------------------------------
-
-
-class MeasurementEngine:
-    """Smooth, threshold and time-limit the face measurements."""
-
-    def __init__(
-        self,
-        *,
-        ear_smoothing_frames: int = 3,
-        mar_smoothing_frames: int = 5,
-        perclos_window_s: float = 60.0,
-        perclos_min_window_s: float = 10.0,
-        prolonged_ms: float = 900.0,
-        microsleep_ms: float = 1500.0,
-        blink_max_ms: float = 500.0,
-        yawn_mar: float = 0.60,
-        yawn_min_ms: float = 800.0,
-        distracted_ms: float = 1500.0,
-    ):
-        self.ear_history: deque[float] = deque(maxlen=max(1, ear_smoothing_frames))
-        self.mar_history: deque[float] = deque(maxlen=max(1, mar_smoothing_frames))
-        self.baseline = 0.26
-        self.samples = 0
-        self.eye_state = "unknown"
-        self.closed_since: float | None = None
-        self.closure_candidate: float | None = None
-        self.closure_ms = 0.0
-        self.prolonged_emitted = False
-        self.microsleep_emitted = False
-        self.yawn_since: float | None = None
-        self.yawn_ms = 0.0
-        self.yawn_emitted = False
-        self.yawn_state = "clear"
-        self.blinks = 0
-        self.microsleeps = 0
-        self.yawns = 0
-        self.perclos: deque[tuple[float, bool]] = deque()
-        self.perclos_window_s = perclos_window_s
-        self.perclos_min_window_s = perclos_min_window_s
-        self.prolonged_ms = prolonged_ms
-        self.microsleep_ms = microsleep_ms
-        self.blink_max_ms = blink_max_ms
-        self.yawn_mar = yawn_mar
-        self.yawn_min_ms = yawn_min_ms
-        self.distracted_ms = distracted_ms
-        self.away_since: float | None = None
-        self.away_ms = 0.0
-        self.last_state = "unknown"
-
-    def reset_tracking(self) -> None:
-        self.ear_history.clear()
-        self.mar_history.clear()
-        self.eye_state = "unknown"
-        self.closed_since = None
-        self.closure_candidate = None
-        self.closure_ms = 0.0
-        self.prolonged_emitted = False
-        self.microsleep_emitted = False
-        self.yawn_since = None
-        self.yawn_ms = 0.0
-        self.yawn_emitted = False
-        self.yawn_state = "clear"
-
-    def _threshold(self, pitch: float | None) -> float:
-        ratio = 0.55 if pitch is not None and pitch > 25.0 else 0.65
-        # Do not let a low personal baseline drive the threshold so low that a
-        # real closure is missed. 0.15 is a floor for this landmark model; the
-        # 0.20 cap prevents a high baseline from calling an open eye closed.
-        return min(0.20, max(0.15, self.baseline * ratio))
-
-    def _adapt_baseline(self, ear: float, obs: FaceObservation) -> None:
-        if obs.yaw is not None and abs(obs.yaw) > 30.0:
-            return
-        if obs.pitch is not None and abs(obs.pitch) > 20.0:
-            return
-        alpha = 0.05 if self.samples < 30 else 0.01
-        self.baseline = (1.0 - alpha) * self.baseline + alpha * ear
-        self.baseline = min(0.40, max(0.16, self.baseline))
-        self.samples += 1
-
-    def _append_perclos(self, timestamp: float, closed: bool) -> None:
-        self.perclos.append((timestamp, closed))
-        cutoff = timestamp - self.perclos_window_s
-        while self.perclos and self.perclos[0][0] < cutoff:
-            self.perclos.popleft()
-
-    def _perclos_value(self) -> tuple[float | None, float]:
-        if not self.perclos:
-            return None, 0.0
-        window = self.perclos[-1][0] - self.perclos[0][0]
-        if window < self.perclos_min_window_s:
-            return None, window
-        closed = sum(1 for _, value in self.perclos if value)
-        return closed / len(self.perclos), window
-
-    def update(
-        self,
-        obs: FaceObservation | None,
-        timestamp: float,
-        *,
-        source_frame_width: int,
-        source_frame_height: int,
-    ) -> dict[str, Any]:
-        if obs is None:
-            self.reset_tracking()
-            self.away_since = None
-            self.away_ms = 0.0
-            self.last_state = "no_face"
-            return self._result(
-                state="no_face",
-                eye_state="unknown",
-                quality="no_face",
-                quality_detail="face not detected",
-                ear_raw=None,
-                ear_smoothed=None,
-                threshold=None,
-                mar_raw=None,
-                mar_smoothed=None,
-                head_state="unknown",
-                obs=None,
-                distraction_state="unknown",
-            )
-
-        if obs.quality != "good":
-            self.reset_tracking()
-            self.away_since = None
-            self.away_ms = 0.0
-            self.last_state = "uncertain"
-            return self._result(
-                state="uncertain",
-                eye_state="unknown",
-                quality=obs.quality,
-                quality_detail=obs.quality_detail,
-                ear_raw=obs.ear,
-                ear_smoothed=None,
-                threshold=None,
-                mar_raw=obs.mar,
-                mar_smoothed=None,
-                head_state=_head_state(obs.yaw, obs.pitch),
-                obs=obs,
-                distraction_state="unknown",
-            )
-
-        threshold = self._threshold(obs.pitch)
-        raw_ear = float(obs.ear)
-        if self.eye_state == "closed" and raw_ear >= threshold:
-            # Reopening is never delayed by the closing median.
-            self.ear_history.clear()
-        self.ear_history.append(raw_ear)
-        ear_smoothed = float(statistics.median(self.ear_history))
-        if raw_ear <= threshold:
-            if self.closure_candidate is None:
-                self.closure_candidate = timestamp
-        else:
-            # Clear the start time as soon as the raw eye is open. Keeping it
-            # through a marginal open frame can later report a long closure
-            # that never happened.
-            self.closure_candidate = None
-
-        self.mar_history.append(float(obs.mar))
-        mar_smoothed = float(statistics.median(self.mar_history))
-        if self.eye_state == "closed" and raw_ear >= threshold:
-            eye_state = "open"
-        else:
-            eye_state = "closed" if ear_smoothed <= threshold else "open"
-        self.eye_state = eye_state
-
-        if eye_state == "closed":
-            if self.closed_since is None:
-                self.closed_since = self.closure_candidate or timestamp
-                self.prolonged_emitted = False
-                self.microsleep_emitted = False
-            self.closure_ms = max(0.0, (timestamp - self.closed_since) * 1000.0)
-            self.yawn_since = None
-            self.yawn_ms = 0.0
-            self.yawn_emitted = False
-            self.yawn_state = "clear"
-            self._append_perclos(timestamp, True)
-            if self.closure_ms >= self.microsleep_ms:
-                if not self.microsleep_emitted:
-                    self.microsleeps += 1
-                    self.microsleep_emitted = True
-                    self.prolonged_emitted = True
-                state = "microsleep"
-            elif self.closure_ms >= self.prolonged_ms:
-                self.prolonged_emitted = True
-                state = "prolonged_closure"
-            else:
-                state = "eyes_closed"
-        else:
-            if self.closed_since is not None:
-                closed_ms = max(0.0, (timestamp - self.closed_since) * 1000.0)
-                if closed_ms < self.blink_max_ms:
-                    self.blinks += 1
-                self.closed_since = None
-                self.closure_ms = 0.0
-                self.prolonged_emitted = False
-                self.microsleep_emitted = False
-            self._adapt_baseline(ear_smoothed, obs)
-            self._append_perclos(timestamp, False)
-
-            if mar_smoothed >= self.yawn_mar:
-                if self.yawn_since is None:
-                    self.yawn_since = timestamp
-                    self.yawn_emitted = False
-                self.yawn_ms = max(0.0, (timestamp - self.yawn_since) * 1000.0)
-                if self.yawn_ms >= self.yawn_min_ms:
-                    self.yawn_state = "yawning"
-                    if not self.yawn_emitted:
-                        self.yawns += 1
-                        self.yawn_emitted = True
-                else:
-                    self.yawn_state = "mouth_open"
-            else:
-                self.yawn_since = None
-                self.yawn_ms = 0.0
-                self.yawn_emitted = False
-                self.yawn_state = "clear"
-
-            state = "yawning" if self.yawn_state == "yawning" else "alert"
-
-        head_state = _head_state(obs.yaw, obs.pitch)
-        if head_state == "unknown":
-            self.away_since = None
-            self.away_ms = 0.0
-            distraction_state = "unknown"
-        elif head_state == "forward":
-            self.away_since = None
-            self.away_ms = 0.0
-            distraction_state = "forward"
-        else:
-            if self.away_since is None:
-                self.away_since = timestamp
-            self.away_ms = max(0.0, (timestamp - self.away_since) * 1000.0)
-            distraction_state = "distracted" if self.away_ms >= self.distracted_ms else "glance"
-
-        self.last_state = state
-        return self._result(
-            state=state,
-            eye_state=eye_state,
-            quality=obs.quality,
-            quality_detail=obs.quality_detail,
-            ear_raw=obs.ear,
-            ear_smoothed=ear_smoothed,
-            threshold=threshold,
-            mar_raw=obs.mar,
-            mar_smoothed=mar_smoothed,
-            head_state=head_state,
-            obs=obs,
-            distraction_state=distraction_state,
-        )
-
-    def _result(
-        self,
-        *,
-        state: str,
-        eye_state: str,
-        quality: str,
-        quality_detail: str,
-        ear_raw: float | None,
-        ear_smoothed: float | None,
-        threshold: float | None,
-        mar_raw: float | None,
-        mar_smoothed: float | None,
-        head_state: str,
-        obs: FaceObservation | None,
-        distraction_state: str,
-    ) -> dict[str, Any]:
-        perclos, window = self._perclos_value()
-        return {
-            "state": state,
-            "eye_state": eye_state,
-            "quality": quality,
-            "quality_detail": quality_detail,
-            "ear_raw": ear_raw,
-            "ear_smoothed": ear_smoothed,
-            "threshold": threshold,
-            "closure_ms": self.closure_ms,
-            "mar_raw": mar_raw,
-            "mar_smoothed": mar_smoothed,
-            "mouth_state": self.yawn_state,
-            "mouth_open_ms": self.yawn_ms,
-            "yawns": self.yawns,
-            "blinks": self.blinks,
-            "microsleeps": self.microsleeps,
-            "head_state": head_state,
-            "yaw": None if obs is None else obs.yaw,
-            "pitch": None if obs is None else obs.pitch,
-            "roll": None if obs is None else obs.roll,
-            "away_ms": self.away_ms,
-            "distraction_state": distraction_state,
-            "perclos": perclos,
-            "perclos_window_s": window,
-            "face_width": None if obs is None else obs.face_width,
-        }
-
-
-def _head_state(yaw: float | None, pitch: float | None) -> str:
-    if yaw is None or pitch is None:
-        return "unknown"
-    # A small dead zone prevents a camera mounted slightly off-centre from
-    # reporting a permanent left/right turn. Normal mirror glances stay inside
-    # this band; a clear cabin-facing turn does not.
-    if yaw > 30.0:
-        return "left"
-    if yaw < -30.0:
-        return "right"
-    if pitch > 25.0:
-        return "down"
-    if pitch < -20.0:
-        return "up"
-    return "forward"
-
-
-def _driver_state(measurements: dict[str, Any]) -> tuple[str, str]:
-    tracking = measurements["quality"] == "good" and measurements["eye_state"] in {"open", "closed"}
-    if measurements["state"] in {"no_face", "uncertain"} or not tracking:
-        reason = measurements["quality_detail"]
-        return "TRACKING UNCERTAIN", reason
-    if measurements["state"] in {"prolonged_closure", "microsleep"}:
-        return (
-            "DROWSY",
-            f"eyes closed {measurements['closure_ms']:.0f} ms; "
-            f"smoothed EAR {measurements['ear_smoothed']:.3f}",
-        )
-    if measurements["distraction_state"] == "distracted":
-        return (
-            "DISTRACTED",
-            f"head {measurements['head_state']} for {measurements['away_ms']:.0f} ms",
-        )
-    if measurements["state"] == "yawning":
-        return (
-            "YAWNING",
-            f"mouth open {measurements['mouth_open_ms']:.0f} ms; "
-            f"smoothed MAR {measurements['mar_smoothed']:.2f}",
-        )
-    if measurements["eye_state"] == "closed":
-        if measurements["closure_ms"] < 500.0:
-            return (
-                "BLINK",
-                f"brief blink; closure {measurements['closure_ms']:.0f} ms",
-            )
-        return (
-            "EYES CLOSED",
-            f"closure {measurements['closure_ms']:.0f} ms; sustained alert not reached",
-        )
-    if measurements["distraction_state"] == "glance":
-        return (
-            "GLANCE",
-            f"head {measurements['head_state']} for {measurements['away_ms']:.0f} ms",
-        )
-    return "ATTENTIVE", "face tracked; eyes open; head forward"
-
-
-# ---------------------------------------------------------------------------
-# Overlay
-# ---------------------------------------------------------------------------
 
 
 def _text(
@@ -820,6 +432,14 @@ def _state_colour(main_state: str) -> tuple[int, int, int]:
     return GREEN
 
 
+def _object_colour(label: str) -> tuple[int, int, int]:
+    return {
+        "phone": CYAN,
+        "bottle": (230, 180, 80),
+        "cigarette": ORANGE,
+    }.get(label, WHITE)
+
+
 def annotate(
     frame: np.ndarray,
     *,
@@ -831,6 +451,8 @@ def annotate(
     process_fps: float,
     process_ms: float,
     frame_age_ms: float,
+    detections: list[dict[str, Any]] | None = None,
+    behaviours: dict[str, dict[str, Any]] | None = None,
 ) -> np.ndarray:
     canvas = frame.copy()
     height, width = canvas.shape[:2]
@@ -839,21 +461,28 @@ def annotate(
     sy = height / float(proc_h)
     colour = _state_colour(main_state)
 
+    for detection in detections or []:
+        bbox = detection.get("bbox")
+        if not bbox or len(bbox) != 4:
+            continue
+        x1 = int(max(0.0, min(1.0, float(bbox[0]))) * width)
+        y1 = int(max(0.0, min(1.0, float(bbox[1]))) * height)
+        x2 = int(max(0.0, min(1.0, float(bbox[2]))) * width)
+        y2 = int(max(0.0, min(1.0, float(bbox[3]))) * height)
+        object_colour = _object_colour(str(detection.get("label", "")))
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), object_colour, 2, cv2.LINE_AA)
+        label = f"{detection.get('label', '?')} {float(detection.get('confidence', 0.0)):.2f}"
+        _text(canvas, label, (x1 + 3, max(16, y1 - 6)), scale=0.52, colour=object_colour, thickness=1)
+
     state_scale = 1.02
     reason_scale = 0.59
-    state_w, _ = cv2.getTextSize(
-        main_state, cv2.FONT_HERSHEY_DUPLEX, state_scale, 2
-    )[0]
-    reason_w, _ = cv2.getTextSize(
-        main_reason, cv2.FONT_HERSHEY_DUPLEX, reason_scale, 1
-    )[0]
+    state_w, _ = cv2.getTextSize(main_state, cv2.FONT_HERSHEY_DUPLEX, state_scale, 2)[0]
+    reason_w, _ = cv2.getTextSize(main_reason, cv2.FONT_HERSHEY_DUPLEX, reason_scale, 1)[0]
     panel_max = max(330, width - 300)
     max_reason_w = max(220, panel_max - 52)
     if reason_w > max_reason_w:
         reason_scale *= max_reason_w / float(reason_w)
-        reason_w, _ = cv2.getTextSize(
-            main_reason, cv2.FONT_HERSHEY_DUPLEX, reason_scale, 1
-        )[0]
+        reason_w, _ = cv2.getTextSize(main_reason, cv2.FONT_HERSHEY_DUPLEX, reason_scale, 1)[0]
     panel_w = min(panel_max, max(330, max(state_w, reason_w) + 52))
     _panel(canvas, 18, 18, panel_w, 116)
     cv2.rectangle(canvas, (18, 18), (24, 134), colour, -1)
@@ -873,16 +502,21 @@ def annotate(
             dtype=np.int32,
         )
         cv2.polylines(canvas, [mouth.reshape(-1, 1, 2)], True, CYAN, 2, cv2.LINE_AA)
-        center = (int(p[MOUTH_TOP][0] + p[MOUTH_BOTTOM][0]) // 2,
-                  int(p[MOUTH_TOP][1] + p[MOUTH_BOTTOM][1]) // 2)
+        center = (
+            int(p[MOUTH_TOP][0] + p[MOUTH_BOTTOM][0]) // 2,
+            int(p[MOUTH_TOP][1] + p[MOUTH_BOTTOM][1]) // 2,
+        )
         cv2.circle(canvas, center, 3, CYAN, -1, cv2.LINE_AA)
 
-        x1, y1, x2, y2 = [int(round(v)) for v in (
-            obs.bbox[0] * sx,
-            obs.bbox[1] * sy,
-            obs.bbox[2] * sx,
-            obs.bbox[3] * sy,
-        )]
+        x1, y1, x2, y2 = [
+            int(round(v))
+            for v in (
+                obs.bbox[0] * sx,
+                obs.bbox[1] * sy,
+                obs.bbox[2] * sx,
+                obs.bbox[3] * sy,
+            )
+        ]
         cv2.rectangle(canvas, (x1, y1), (x2, y2), colour, 2, cv2.LINE_AA)
 
         if obs.yaw is not None and obs.pitch is not None:
@@ -895,7 +529,6 @@ def annotate(
             )
             cv2.arrowedLine(canvas, nose, end, colour, 2, cv2.LINE_AA, tipLength=0.18)
 
-    # Small, readable metric line; detailed numbers stay in the HTML panel.
     eye = measurements["eye_state"]
     ear = measurements["ear_smoothed"]
     ear_text = "-" if ear is None else f"{ear:.3f}"
@@ -906,311 +539,24 @@ def annotate(
     )
     metric_w, _ = cv2.getTextSize(metric_text, cv2.FONT_HERSHEY_DUPLEX, 0.63, 1)[0]
     _panel(canvas, 18, height - 48, min(width - 36, metric_w + 26), 34)
-    _text(
-        canvas,
-        metric_text,
-        (30, height - 24),
-        scale=0.63,
-        colour=WHITE,
-        thickness=1,
-    )
+    _text(canvas, metric_text, (30, height - 24), scale=0.63, colour=WHITE, thickness=1)
     perf_text = f"{process_fps:.1f} fps  {process_ms:.0f} ms  age {frame_age_ms:.0f}"
     perf_w, _ = cv2.getTextSize(perf_text, cv2.FONT_HERSHEY_DUPLEX, 0.48, 1)[0]
     perf_x = width - perf_w - 38
     _panel(canvas, perf_x, 18, perf_w + 24, 42)
-    _text(
-        canvas,
-        perf_text,
-        (perf_x + 12, 45),
-        scale=0.48,
-        colour=WHITE,
-        thickness=1,
-    )
+    _text(canvas, perf_text, (perf_x + 12, 45), scale=0.48, colour=WHITE, thickness=1)
+
+    active = [
+        key
+        for key, value in (behaviours or {}).items()
+        if value.get("suspected")
+    ]
+    if active:
+        active_text = "suspected: " + ", ".join(active)
+        active_w, _ = cv2.getTextSize(active_text, cv2.FONT_HERSHEY_DUPLEX, 0.55, 1)[0]
+        _panel(canvas, 18, 142, active_w + 26, 32)
+        _text(canvas, active_text, (30, 164), scale=0.55, colour=ORANGE, thickness=1)
     return canvas
-
-
-# ---------------------------------------------------------------------------
-# Camera capture
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class FramePacket:
-    stream_bgr: np.ndarray
-    process_bgr: np.ndarray
-    timestamp: float
-    sequence: int
-
-
-def _letterbox(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """Resize without changing face geometry; pad with black if needed."""
-    target_w, target_h = int(size[0]), int(size[1])
-    src_h, src_w = frame.shape[:2]
-    if (src_w, src_h) == (target_w, target_h):
-        return frame
-    scale = min(target_w / float(src_w), target_h / float(src_h))
-    new_w = max(1, int(round(src_w * scale)))
-    new_h = max(1, int(round(src_h * scale)))
-    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    if new_w == target_w and new_h == target_h:
-        return resized
-    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-    x = (target_w - new_w) // 2
-    y = (target_h - new_h) // 2
-    canvas[y:y + new_h, x:x + new_w] = resized
-    return canvas
-
-
-class FrameStore:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._changed = threading.Condition(self._lock)
-        self._packet: FramePacket | None = None
-        self._camera_info: dict[str, Any] = {}
-        self._error: str | None = None
-        self._capture_times: deque[float] = deque(maxlen=30)
-        self._sequence = 0
-
-    def put(self, packet: FramePacket, camera_info: dict[str, Any] | None = None) -> None:
-        with self._changed:
-            self._packet = packet
-            self._sequence = packet.sequence
-            if camera_info is not None:
-                self._camera_info = camera_info
-            self._error = None
-            self._capture_times.append(time.monotonic())
-            self._changed.notify_all()
-
-    def set_error(self, message: str) -> None:
-        with self._changed:
-            self._error = message
-
-    def latest(self) -> tuple[FramePacket | None, dict[str, Any], str | None, float]:
-        with self._lock:
-            packet = self._packet
-            info = dict(self._camera_info)
-            error = self._error
-            fps = 0.0
-            if len(self._capture_times) >= 2:
-                span = self._capture_times[-1] - self._capture_times[0]
-                if span > 0:
-                    fps = (len(self._capture_times) - 1) / span
-            return packet, info, error, fps
-
-    def wait_next(self, last_sequence: int, timeout: float = 0.5) -> tuple[FramePacket | None, dict[str, Any], str | None, float]:
-        with self._changed:
-            self._changed.wait_for(
-                lambda: self._packet is not None and self._sequence != last_sequence,
-                timeout=timeout,
-            )
-            packet = self._packet
-            info = dict(self._camera_info)
-            error = self._error
-            fps = 0.0
-            if len(self._capture_times) >= 2:
-                span = self._capture_times[-1] - self._capture_times[0]
-                if span > 0:
-                    fps = (len(self._capture_times) - 1) / span
-            return packet, info, error, fps
-
-
-class CameraWorker(threading.Thread):
-    def __init__(self, args: argparse.Namespace, store: FrameStore):
-        super().__init__(name="camera", daemon=True)
-        self.args = args
-        self.store = store
-        self.stop_event = threading.Event()
-        self.sequence = 0
-        self._info: dict[str, Any] = {
-            "backend": "starting",
-            "capture_resolution": "-",
-            "capture_fps": None,
-            "stream_resolution": f"{args.stream_width}x{args.stream_height}",
-            "process_resolution": f"{args.process_width}x{args.process_height}",
-            "error": None,
-        }
-
-    def stop(self) -> None:
-        self.stop_event.set()
-
-    def _publish(self, frame_bgr: np.ndarray) -> None:
-        if self.args.mirror:
-            frame_bgr = cv2.flip(frame_bgr, 1)
-        self._info["error"] = None
-        stream_size = (int(self.args.stream_width), int(self.args.stream_height))
-        process_size = (int(self.args.process_width), int(self.args.process_height))
-        stream = _letterbox(frame_bgr, stream_size)
-        process = _letterbox(frame_bgr, process_size)
-        self.sequence += 1
-        self.store.put(
-            FramePacket(stream, process, time.monotonic(), self.sequence),
-            dict(self._info),
-        )
-
-    def run(self) -> None:
-        if self.args.image:
-            self._run_image()
-            return
-        if self.args.camera_backend in {"auto", "picamera2"}:
-            try:
-                self._run_picamera2()
-                return
-            except Exception as exc:
-                if self.args.camera_backend == "picamera2":
-                    self._error(f"Picamera2 failed: {type(exc).__name__}: {exc}")
-                    return
-                self._info["backend"] = f"opencv (Picamera2 unavailable: {type(exc).__name__})"
-        self._run_opencv()
-
-    def _error(self, message: str) -> None:
-        print(f"[camera] {message}", flush=True)
-        self._info["error"] = message
-        self.store.set_error(message)
-        self.sequence += 1
-        self.store.put(
-            FramePacket(
-                np.zeros((self.args.stream_height, self.args.stream_width, 3), dtype=np.uint8),
-                np.zeros((self.args.process_height, self.args.process_width, 3), dtype=np.uint8),
-                time.monotonic(),
-                self.sequence,
-            ),
-            dict(self._info),
-        )
-
-    def _run_image(self) -> None:
-        path = Path(self.args.image)
-        image = cv2.imread(str(path))
-        if image is None:
-            self._error(f"cannot read image: {path}")
-            return
-        self._info.update(
-            {
-                "backend": "image",
-                "capture_resolution": f"{image.shape[1]}x{image.shape[0]}",
-                "capture_fps": self.args.camera_fps,
-            }
-        )
-        interval = 1.0 / max(1.0, float(self.args.camera_fps))
-        while not self.stop_event.is_set():
-            self._publish(image.copy())
-            self.stop_event.wait(interval)
-
-    def _run_opencv(self) -> None:
-        backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
-        cap = cv2.VideoCapture(int(self.args.camera), backend)
-        if not cap.isOpened():
-            cap.release()
-            self._error(f"camera {self.args.camera} could not be opened")
-            return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.args.capture_width))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.args.capture_height))
-        cap.set(cv2.CAP_PROP_FPS, int(self.args.camera_fps))
-        if sys.platform.startswith("win"):
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self._info.update(
-            {
-                "backend": "opencv",
-                "capture_resolution": f"{actual_w}x{actual_h}",
-                "capture_fps": self.args.camera_fps,
-            }
-        )
-        interval = 1.0 / max(1.0, float(self.args.camera_fps))
-        try:
-            while not self.stop_event.is_set():
-                started = time.monotonic()
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    self._error("camera returned an empty frame")
-                    self.stop_event.wait(2.0)
-                    continue
-                self._publish(frame)
-                elapsed = time.monotonic() - started
-                if elapsed < interval:
-                    self.stop_event.wait(interval - elapsed)
-        finally:
-            cap.release()
-
-    def _run_picamera2(self) -> None:
-        from picamera2 import Picamera2
-
-        picam2 = Picamera2()
-        capture_size = (int(self.args.capture_width), int(self.args.capture_height))
-        stream_size = (int(self.args.stream_width), int(self.args.stream_height))
-        process_size = (int(self.args.process_width), int(self.args.process_height))
-
-        # Ask the ISP for a full camera resolution main stream and a tiny
-        # inference stream. If the lores combination is unsupported, fall back
-        # to one full-resolution stream and resize in software.
-        has_lores = True
-        try:
-            config = picam2.create_video_configuration(
-                main={"size": capture_size, "format": "RGB888"},
-                lores={"size": process_size, "format": "RGB888"},
-                controls={"FrameRate": float(self.args.camera_fps)},
-                buffer_count=3,
-            )
-            picam2.configure(config)
-        except Exception:
-            picam2.close()
-            picam2 = Picamera2()
-            has_lores = False
-            config = picam2.create_video_configuration(
-                main={"size": capture_size, "format": "RGB888"},
-                controls={"FrameRate": float(self.args.camera_fps)},
-                buffer_count=3,
-            )
-            picam2.configure(config)
-        try:
-            from libcamera import controls
-
-            picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
-        except Exception:
-            pass
-        picam2.start()
-        self._info.update(
-            {
-                "backend": "picamera2",
-                "capture_resolution": f"{capture_size[0]}x{capture_size[1]}",
-                "capture_fps": self.args.camera_fps,
-            }
-        )
-        try:
-            while not self.stop_event.is_set():
-                request = picam2.capture_request()
-                try:
-                    main = request.make_array("main")
-                    lores = request.make_array("lores") if has_lores else None
-                finally:
-                    request.release()
-                if main.ndim == 2:
-                    stream = cv2.cvtColor(main, cv2.COLOR_GRAY2BGR)
-                else:
-                    stream = cv2.cvtColor(main, cv2.COLOR_RGB2BGR)
-                if has_lores and lores is not None:
-                    process = cv2.cvtColor(lores, cv2.COLOR_RGB2BGR) if lores.ndim == 3 else cv2.cvtColor(lores, cv2.COLOR_GRAY2BGR)
-                else:
-                    process = _letterbox(stream, process_size)
-                if self.args.mirror:
-                    stream = cv2.flip(stream, 1)
-                    process = cv2.flip(process, 1)
-                if (stream.shape[1], stream.shape[0]) != stream_size:
-                    stream = _letterbox(stream, stream_size)
-                self._info["error"] = None
-                self.sequence += 1
-                self.store.put(
-                    FramePacket(stream, process, time.monotonic(), self.sequence),
-                    dict(self._info),
-                )
-        finally:
-            picam2.stop()
-            picam2.close()
-
-
-# ---------------------------------------------------------------------------
-# Service
-# ---------------------------------------------------------------------------
 
 
 class DMSService:
@@ -1229,6 +575,23 @@ class DMSService:
             yawn_min_ms=args.yawn_ms,
             distracted_ms=args.distracted_ms,
         )
+        self.fusion = FusionEngine(
+            BehaviourConfig(
+                stale_ms=args.object_stale_ms,
+                min_confidence=args.object_min_confidence,
+                phone_min_ms=args.object_phone_ms,
+                drinking_min_ms=args.object_drink_ms,
+                smoking_min_ms=args.object_smoke_ms,
+                min_observations=args.object_min_observations,
+                face_radius_scale=args.object_face_radius,
+                mouth_radius_scale=args.object_mouth_radius,
+            )
+        )
+        self.resource_monitor = ResourceMonitor(min_interval_s=1.0)
+        self.object_worker: ObjectWorker | None = None
+        self._object_start_thread: threading.Thread | None = None
+        self._object_lock = threading.Lock()
+        self._object_snapshot = self._initial_object_snapshot()
         self._lock = threading.Lock()
         self._status: dict[str, Any] = self._initial_status()
         self._jpeg: bytes | None = None
@@ -1236,15 +599,33 @@ class DMSService:
         self._thread: threading.Thread | None = None
         self._process_times: deque[float] = deque(maxlen=40)
         self._last_state: str = "STARTING"
+        self._last_behaviour_states: dict[str, str] = {}
+        self._last_object_status: str | None = None
         self._last_event: str | None = None
-        self._last_measurements: dict[str, Any] = {}
+        self._recent_events: deque[dict[str, str]] = deque(maxlen=10)
+
+    def _initial_object_snapshot(self) -> ObjectSnapshot:
+        if not self.args.objects:
+            return ObjectSnapshot.disabled()
+        return ObjectSnapshot(
+            status="starting",
+            enabled=True,
+            model=Path(self.args.object_model).name if self.args.object_model else None,
+            classes=tuple(self.args.object_classes),
+            stale_ms=self.args.object_stale_ms,
+        )
 
     def _initial_status(self) -> dict[str, Any]:
         return {
             "mode": "starting",
             "main_state": "STARTING",
             "main_reason": "Loading the face model.",
-            "tracking": {"state": "uncertain", "reason": "starting"},
+            "tracking": {
+                "state": "uncertain",
+                "reason": "starting",
+                "confidence": None,
+                "confidence_basis": "heuristic, not a model probability",
+            },
             "eyes": {
                 "state": "-",
                 "ear_raw": None,
@@ -1252,13 +633,33 @@ class DMSService:
                 "threshold": None,
                 "closure_ms": None,
             },
-            "mouth": {"state": "-", "mar_raw": None, "mar_smoothed": None, "open_ms": None},
-            "head": {"state": "-", "yaw": None, "pitch": None, "roll": None, "away_ms": None},
+            "mouth": {
+                "state": "-",
+                "mar_raw": None,
+                "mar_smoothed": None,
+                "open_ms": None,
+            },
+            "head": {
+                "state": "-",
+                "yaw": None,
+                "pitch": None,
+                "roll": None,
+                "away_ms": None,
+            },
+            "independent": {
+                "drowsiness": "unknown",
+                "attention": "unknown",
+                "yawning": False,
+            },
             "fatigue": {"perclos": None, "window_s": 0.0},
             "blinks": 0,
             "microsleeps": 0,
             "yawns": 0,
-            "performance": {"process_fps": None, "process_ms": None, "frame_age_ms": None},
+            "performance": {
+                "process_fps": None,
+                "process_ms": None,
+                "frame_age_ms": None,
+            },
             "camera": {
                 "backend": "-",
                 "capture_resolution": "-",
@@ -1267,8 +668,29 @@ class DMSService:
                 "process_resolution": f"{self.args.process_width}x{self.args.process_height}",
                 "error": None,
             },
+            "face_model": {
+                "name": Path(self.args.model).name,
+                "status": "starting",
+                "source": "MediaPipe Face Landmarker",
+            },
+            "preprocessing": {
+                "mode": self.args.tint_mode,
+                "label": self.args.tint_label,
+                "awb": self.args.awb,
+                "camera_controls": "default",
+            },
+            "resources": self.resource_monitor.sample(force=True),
+            "object": self._object_snapshot.to_dict(time.monotonic()),
+            "detections": [],
+            "behaviours": {},
+            "active_behaviours": [],
             "tint": self.args.tint_label,
             "last_event": None,
+            "recent_events": [],
+            "alcohol": {
+                "status": "unavailable",
+                "reason": "No physical breath-alcohol sensor is connected; video cannot measure alcohol.",
+            },
         }
 
     def start(self) -> None:
@@ -1279,32 +701,100 @@ class DMSService:
             min_tracking_confidence=self.args.face_tracking_confidence,
         )
         self.camera.start()
+        # Start the face processor before attempting to load the optional object
+        # model.  A missing, slow or incompatible object backend can therefore
+        # never delay or block the face core.
         self._thread = threading.Thread(target=self._run, name="processor", daemon=True)
         self._thread.start()
+        if self.args.objects:
+            self._object_start_thread = threading.Thread(
+                target=self._start_objects, name="object-start", daemon=True
+            )
+            self._object_start_thread.start()
+
+    def _start_objects(self) -> None:
+        detector = None
+        try:
+            detector = build_object_detector(self.args)
+            with self._object_lock:
+                if self.stop_event.is_set():
+                    detector.close()
+                    return
+                worker = ObjectWorker(
+                    self.store,
+                    detector,
+                    interval_ms=self.args.object_interval_ms,
+                    stale_ms=self.args.object_stale_ms,
+                    classes=tuple(self.args.object_classes),
+                    color_mode=self.args.tint_mode,
+                )
+                self.object_worker = worker
+                worker.start()
+            print(
+                f"Object module: {self.args.object_backend} "
+                f"model={self.args.object_model} classes={','.join(self.args.object_classes)}",
+                flush=True,
+            )
+        except Exception as exc:
+            if detector is not None:
+                try:
+                    detector.close()
+                except Exception:
+                    pass
+            reason = f"object module unavailable: {type(exc).__name__}: {exc}"
+            self._object_snapshot = ObjectSnapshot.unavailable(
+                reason, model=Path(self.args.object_model).name
+            )
+            print(f"[objects] {reason}", flush=True)
 
     def stop(self) -> None:
         self.stop_event.set()
         self.camera.stop()
+        if self._object_start_thread is not None:
+            self._object_start_thread.join(timeout=3.0)
+        with self._object_lock:
+            worker = self.object_worker
+            self.object_worker = None
+        if worker is not None:
+            worker.stop()
+            worker.join(timeout=2.0)
+            worker.close()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         if self.model is not None:
             self.model.close()
 
+    def _snapshot(self) -> ObjectSnapshot:
+        if self.object_worker is not None:
+            return self.object_worker.snapshot()
+        return self._object_snapshot
+
+    def _record_event(self, *, kind: str, label: str, detail: str) -> None:
+        entry = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "kind": kind,
+            "label": label,
+            "detail": detail,
+        }
+        with self._lock:
+            self._recent_events.appendleft(entry)
+            self._last_event = f"{entry['time']}  {label}: {detail}"
+        print(f"[event] {label}: {detail}", flush=True)
+
     def _run(self) -> None:
         assert self.model is not None
         last_sequence = -1
         while not self.stop_event.is_set():
-            packet, camera_info, camera_error, capture_fps = self.store.wait_next(last_sequence, timeout=0.5)
+            packet, camera_info, camera_error, capture_fps = self.store.wait_next(
+                last_sequence, timeout=0.5
+            )
             if packet is None or packet.sequence == last_sequence:
                 continue
             last_sequence = packet.sequence
             started = time.perf_counter()
             try:
-                stream_bgr, process_bgr = _preprocess_frames(
-                    [packet.stream_bgr, packet.process_bgr],
-                    self.args.night,
-                    self.args.tint_fix,
-                )
+                process_bgr = preprocess_frame(packet.process_bgr, self.args.tint_mode)
+                stream_bgr = preprocess_frame(packet.stream_bgr, self.args.tint_mode)
                 obs = self.model.detect(
                     process_bgr,
                     packet.timestamp,
@@ -1313,11 +803,14 @@ class DMSService:
                 now = time.monotonic()
                 measurements = self.engine.update(
                     obs,
-                    now,
+                    packet.timestamp,
                     source_frame_width=self.args.process_width,
                     source_frame_height=self.args.process_height,
                 )
-                main_state, main_reason = _driver_state(measurements)
+                object_snapshot = self._snapshot()
+                fusion_result = self.fusion.update(measurements, object_snapshot, now)
+                main_state = fusion_result["main_state"]
+                main_reason = fusion_result["main_reason"]
                 process_ms = (time.perf_counter() - started) * 1000.0
                 frame_age_ms = (now - packet.timestamp) * 1000.0
                 self._process_times.append(now)
@@ -1327,17 +820,7 @@ class DMSService:
                     if span > 0:
                         fps = (len(self._process_times) - 1) / span
 
-                if main_state != self._last_state and main_state in {
-                    "DROWSY",
-                    "EYES CLOSED",
-                    "YAWNING",
-                    "DISTRACTED",
-                    "TRACKING UNCERTAIN",
-                }:
-                    stamp = datetime.now().strftime("%H:%M:%S")
-                    self._last_event = f"{stamp}  {main_state}: {main_reason}"
-                self._last_state = main_state
-
+                self._record_state_events(fusion_result, now)
                 annotated = annotate(
                     stream_bgr,
                     obs=obs,
@@ -1348,6 +831,8 @@ class DMSService:
                     process_fps=fps,
                     process_ms=process_ms,
                     frame_age_ms=frame_age_ms,
+                    detections=fusion_result["detections"],
+                    behaviours=fusion_result["behaviours"],
                 )
                 ok, encoded = cv2.imencode(
                     ".jpg",
@@ -1356,11 +841,9 @@ class DMSService:
                 )
                 if not ok:
                     raise RuntimeError("JPEG encoding failed")
-                self._last_measurements = measurements
                 self._update_status(
                     measurements=measurements,
-                    main_state=main_state,
-                    main_reason=main_reason,
+                    fusion_result=fusion_result,
                     camera_info=camera_info,
                     camera_error=camera_error,
                     capture_fps=capture_fps,
@@ -1383,12 +866,47 @@ class DMSService:
                 print(f"[processor] {type(exc).__name__}: {exc}", flush=True)
                 time.sleep(0.5)
 
+    def _record_state_events(self, fusion_result: dict[str, Any], now: float) -> None:
+        main_state = fusion_result["main_state"]
+        if main_state != self._last_state and main_state in {
+            "DROWSY",
+            "EYES CLOSED",
+            "YAWNING",
+            "DISTRACTED",
+            "TRACKING UNCERTAIN",
+        }:
+            self._record_event(
+                kind="core",
+                label=main_state,
+                detail=fusion_result["main_reason"],
+            )
+        self._last_state = main_state
+
+        for key, behaviour in fusion_result["behaviours"].items():
+            state = str(behaviour.get("state", ""))
+            previous = self._last_behaviour_states.get(key)
+            if state == "suspected" and previous != "suspected":
+                self._record_event(
+                    kind="behaviour",
+                    label=behaviour.get("name", key),
+                    detail=behaviour.get("evidence", "suspected from object evidence"),
+                )
+            self._last_behaviour_states[key] = state
+
+        object_status = str(fusion_result["object"].get("status", ""))
+        if object_status in {"error", "unavailable", "stale"} and object_status != self._last_object_status:
+            self._record_event(
+                kind="object",
+                label="objects",
+                detail=f"module {object_status}: {fusion_result['object'].get('error') or 'no fresh detections'}",
+            )
+        self._last_object_status = object_status
+
     def _update_status(
         self,
         *,
         measurements: dict[str, Any],
-        main_state: str,
-        main_reason: str,
+        fusion_result: dict[str, Any],
         camera_info: dict[str, Any],
         camera_error: str | None,
         capture_fps: float,
@@ -1400,23 +918,13 @@ class DMSService:
         camera["capture_fps"] = round(capture_fps, 1) if capture_fps else camera.get("capture_fps")
         if camera_error:
             camera["error"] = camera_error
-        tracking_state = (
-            "good"
-            if (
-                measurements["quality"] == "good"
-                and measurements["eye_state"] in {"open", "closed"}
-                and measurements["state"] not in {"no_face", "uncertain"}
-            )
-            else "uncertain"
-        )
-        tracking_reason = measurements["quality_detail"]
         with self._lock:
             self._status.update(
                 {
                     "mode": "running",
-                    "main_state": main_state,
-                    "main_reason": main_reason,
-                    "tracking": {"state": tracking_state, "reason": tracking_reason},
+                    "main_state": fusion_result["main_state"],
+                    "main_reason": fusion_result["main_reason"],
+                    "tracking": fusion_result["tracking"],
                     "eyes": {
                         "state": measurements["eye_state"],
                         "ear_raw": _round(measurements["ear_raw"], 4),
@@ -1437,6 +945,7 @@ class DMSService:
                         "roll": _round(measurements["roll"], 1),
                         "away_ms": _round(measurements["away_ms"], 1),
                     },
+                    "independent": fusion_result["independent"],
                     "fatigue": {
                         "perclos": _round(measurements["perclos"], 4),
                         "window_s": _round(measurements["perclos_window_s"], 1),
@@ -1450,7 +959,29 @@ class DMSService:
                         "frame_age_ms": round(frame_age_ms, 1),
                     },
                     "camera": camera,
+                    "face_model": {
+                        "name": Path(self.args.model).name,
+                        "status": "running",
+                        "source": "MediaPipe Face Landmarker",
+                    },
+                    "preprocessing": {
+                        "mode": self.args.tint_mode,
+                        "label": self.args.tint_label,
+                        "awb": self.args.awb,
+                        "camera_controls": camera.get("camera_controls", "default"),
+                    },
+                    "resources": self.resource_monitor.sample(),
+                    "object": fusion_result["object"],
+                    "detections": fusion_result["detections"],
+                    "behaviours": fusion_result["behaviours"],
+                    "active_behaviours": fusion_result["active_behaviours"],
+                    "tint": self.args.tint_label,
                     "last_event": self._last_event,
+                    "recent_events": list(self._recent_events),
+                    "alcohol": {
+                        "status": "unavailable",
+                        "reason": "No physical breath-alcohol sensor is connected; video cannot measure alcohol.",
+                    },
                 }
             )
 
@@ -1462,6 +993,15 @@ class DMSService:
         with self._lock:
             return self._jpeg, self._jpeg_seq
 
+    def latest_raw_jpeg(self) -> bytes | None:
+        raw, _info = self.store.latest_raw()
+        if raw is None:
+            return None
+        ok, encoded = cv2.imencode(
+            ".jpg", raw, [cv2.IMWRITE_JPEG_QUALITY, min(85, int(self.args.jpeg_quality))]
+        )
+        return encoded.tobytes() if ok else None
+
 
 def _round(value: Any, digits: int) -> float | None:
     if value is None:
@@ -1470,11 +1010,6 @@ def _round(value: Any, digits: int) -> float | None:
         return round(float(value), digits)
     except (TypeError, ValueError):
         return None
-
-
-# ---------------------------------------------------------------------------
-# Web application
-# ---------------------------------------------------------------------------
 
 
 def create_app(service: DMSService) -> Flask:
@@ -1501,6 +1036,13 @@ def create_app(service: DMSService) -> Flask:
             return Response("not ready", status=503)
         return Response(jpeg, mimetype="image/jpeg")
 
+    @app.get("/snapshot_raw.jpg")
+    def snapshot_raw():
+        jpeg = service.latest_raw_jpeg()
+        if jpeg is None:
+            return Response("not ready", status=503)
+        return Response(jpeg, mimetype="image/jpeg")
+
     @app.get("/video_feed")
     def video_feed():
         def frames():
@@ -1520,11 +1062,12 @@ def create_app(service: DMSService) -> Flask:
                     + jpeg
                     + b"\r\n"
                 )
+
         return Response(frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
     @app.after_request
     def no_cache(response):
-        if request.path in {"/status", "/snapshot.jpg"}:
+        if request.path in {"/status", "/snapshot.jpg", "/snapshot_raw.jpg"}:
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -1533,12 +1076,12 @@ def create_app(service: DMSService) -> Flask:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Raspberry Pi 3 DMS core (face, eyes, mouth, head orientation)"
+        description="Raspberry Pi 3 DMS: face core plus optional object/behaviour module"
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--open", action="store_true", help="open the browser on this machine")
-    parser.add_argument("--image", help="use a still image instead of a camera (for UI testing)")
+    parser.add_argument("--image", help="use a still image instead of a camera (UI testing)")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument(
         "--camera-backend",
@@ -1556,13 +1099,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--jpeg-quality", type=int, default=82)
     parser.add_argument("--mirror", action="store_true", help="mirror the camera image")
     parser.add_argument("--night", action="store_true", help="grayscale + CLAHE for an IR/night camera")
-    parser.add_argument("--tint-fix", action="store_true", default=True, help=argparse.SUPPRESS)
-    parser.add_argument("--no-tint-fix", action="store_false", dest="tint_fix")
+    parser.add_argument(
+        "--tint-mode",
+        choices=("off", "soft", "grayworld", "night"),
+        default="soft",
+        help="conservative colour preprocessing; default soft gray-world",
+    )
+    parser.add_argument("--tint-fix", action="store_true", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--no-tint-fix", action="store_false", dest="tint_fix", help="disable software colour correction")
+    parser.add_argument("--awb", choices=("auto", "manual"), default="auto")
+    parser.add_argument("--red-gain", type=float, default=None)
+    parser.add_argument("--blue-gain", type=float, default=None)
+    parser.add_argument("--exposure-us", type=float, default=None)
+    parser.add_argument("--analogue-gain", type=float, default=None)
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--face-detection-confidence", type=float, default=0.5)
     parser.add_argument("--face-tracking-confidence", type=float, default=0.5)
-    parser.add_argument("--min-face-width", type=float, default=40.0,
-                        help="minimum face width in inference pixels")
+    parser.add_argument("--min-face-width", type=float, default=40.0)
     parser.add_argument("--ear-smoothing", type=int, default=3)
     parser.add_argument("--mar-smoothing", type=int, default=5)
     parser.add_argument("--drowsy-ms", type=float, default=900.0)
@@ -1570,6 +1123,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--yawn-mar", type=float, default=0.60)
     parser.add_argument("--yawn-ms", type=float, default=800.0)
     parser.add_argument("--distracted-ms", type=float, default=1500.0)
+
+    parser.add_argument("--objects", action="store_true", help="enable optional object detection")
+    parser.add_argument(
+        "--object-backend",
+        choices=("none", "mediapipe", "http"),
+        default="none",
+        help="mediapipe local TFLite or a separate HTTP object service",
+    )
+    parser.add_argument("--object-model", default=str(DEFAULT_OBJECT_MODEL))
+    parser.add_argument("--object-service-url", default="http://127.0.0.1:8010/detect")
+    parser.add_argument("--object-timeout-s", type=float, default=2.0)
+    parser.add_argument("--object-classes", default="phone,bottle",
+                        help="comma-separated labels to accept: phone,bottle,cigarette")
+    parser.add_argument("--object-min-confidence", type=float, default=0.35)
+    parser.add_argument("--object-max-results", type=int, default=10)
+    parser.add_argument("--object-interval-ms", type=float, default=500.0)
+    parser.add_argument("--object-stale-ms", type=float, default=1500.0)
+    parser.add_argument("--object-phone-ms", type=float, default=1200.0)
+    parser.add_argument("--object-drink-ms", type=float, default=1000.0)
+    parser.add_argument("--object-smoke-ms", type=float, default=1000.0)
+    parser.add_argument("--object-min-observations", type=int, default=3)
+    parser.add_argument("--object-face-radius", type=float, default=0.40)
+    parser.add_argument("--object-mouth-radius", type=float, default=0.55)
+
     args = parser.parse_args(argv)
 
     args.process_width = max(160, min(int(args.process_width), int(args.stream_width)))
@@ -1578,41 +1155,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.stream_height = max(180, int(args.stream_height))
     args.jpeg_quality = max(50, min(95, int(args.jpeg_quality)))
     args.camera_fps = max(1.0, min(60.0, float(args.camera_fps)))
-    args.tint_label = "night (IR)" if args.night else ("gray-world" if args.tint_fix else "off")
+
+    if args.night:
+        args.tint_mode = "night"
+    if args.tint_fix is False:
+        args.tint_mode = "off"
+    elif args.tint_fix is True:
+        args.tint_mode = "soft"
+    args.tint_label = {
+        "off": "off (raw)",
+        "soft": "soft gray-world",
+        "grayworld": "gray-world",
+        "night": "night (grayscale + CLAHE)",
+    }[args.tint_mode]
+
+    if (args.red_gain is None) != (args.blue_gain is None):
+        parser.error("--red-gain and --blue-gain must be supplied together")
+    if args.awb == "manual" and (args.red_gain is None or args.blue_gain is None):
+        parser.error("--awb manual requires --red-gain and --blue-gain")
+    if args.objects and args.object_backend == "none":
+        args.object_backend = "mediapipe"
+    args.object_classes = [
+        item.strip().lower()
+        for item in str(args.object_classes).split(",")
+        if item.strip()
+    ]
+    unknown = set(args.object_classes) - CANONICAL_LABELS
+    if unknown:
+        parser.error(f"unsupported --object-classes: {sorted(unknown)}")
+    args.object_interval_ms = max(100.0, float(args.object_interval_ms))
+    args.object_stale_ms = max(args.object_interval_ms * 1.5, float(args.object_stale_ms))
+    args.object_min_observations = max(1, int(args.object_min_observations))
     return args
-
-
-def _fix_purple(frame: np.ndarray) -> np.ndarray:
-    image = frame.astype(np.float32)
-    means = image.reshape(-1, 3).mean(axis=0)
-    gray = float(means.mean())
-    gains = np.clip(gray / np.maximum(means, 1.0), 0.72, 1.38)
-    return np.clip(image * gains.reshape(1, 1, 3), 0, 255).astype(np.uint8)
-
-
-def _fix_night(frame: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
-    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-
-def _preprocess_frames(frames: list[np.ndarray], night: bool, tint_fix: bool) -> list[np.ndarray]:
-    out = []
-    for frame in frames:
-        if night:
-            out.append(_fix_night(frame))
-        elif tint_fix:
-            out.append(_fix_purple(frame))
-        else:
-            out.append(frame)
-    return out
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.night and args.tint_fix:
-        args.tint_fix = False
-        args.tint_label = "night (IR)"
     service = DMSService(args)
     print(f"Loading face model: {args.model}", flush=True)
     try:
@@ -1624,20 +1202,29 @@ def main(argv: list[str] | None = None) -> int:
     app = create_app(service)
     atexit.register(service.stop)
     print("", flush=True)
-    print("Pi 3 DMS core", flush=True)
-    print(f"  model     {args.model}", flush=True)
+    print("Pi 3 DMS", flush=True)
+    print(f"  face model {args.model}", flush=True)
     print(
-        f"  camera    {args.camera_backend} capture={args.capture_width}x{args.capture_height} "
+        f"  camera     {args.camera_backend} capture={args.capture_width}x{args.capture_height} "
         f"@{args.camera_fps:g} fps",
         flush=True,
     )
     print(
-        f"  view      stream={args.stream_width}x{args.stream_height} "
+        f"  view       stream={args.stream_width}x{args.stream_height} "
         f"process={args.process_width}x{args.process_height}",
         flush=True,
     )
-    print(f"  open      http://{args.host}:{args.port}", flush=True)
-    print("  stop      Ctrl+C", flush=True)
+    print(f"  colour     {args.tint_mode} ({args.tint_label}) awb={args.awb}", flush=True)
+    if args.objects:
+        print(
+            f"  objects    {args.object_backend} model={args.object_model} "
+            f"classes={','.join(args.object_classes)} interval={args.object_interval_ms:g} ms",
+            flush=True,
+        )
+    else:
+        print("  objects    disabled (face core continues)", flush=True)
+    print(f"  open       http://{args.host}:{args.port}", flush=True)
+    print("  stop       Ctrl+C", flush=True)
     if args.open:
         threading.Timer(
             1.0, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}")

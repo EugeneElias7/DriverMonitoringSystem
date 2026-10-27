@@ -1,0 +1,16 @@
+{
+  "id": "efficientdet_lite0_coco",
+  "path": "models/object/efficientdet_lite0.tflite",
+  "required": false,
+  "url": "https://storage.googleapis.com/download.tensorflow.org/models/tflite/task_library/object_detection/android/lite-model_efficientdet_lite0_detection_metadata_1.tflite",
+  "sha256": "2e04c53bfeac0ac2a30c057c7e2a777594ce39baaac35a92f74fb1e8c4fc4e0b",
+  "size_bytes": 4563519,
+  "kind": "tflite-object-detector",
+  "classes": ["COCO-90; phone and bottle are the only classes enabled by default", "no cigarette class"],
+  "purpose": "optional experimental phone/bottle control model; not a smoking detector and not DMS-validated",
+  "source": "TensorFlow Lite Task Library official storage",
+  "license": "Apache-2.0 (TensorFlow/TFLite model collection); verify the model card before redistribution",
+  "license_status": "official_control",
+  "commercial_note": "Generic COCO model does not detect cigarettes; do not present it as smoking capability.",
+  "measured": "MediaPipe Tasks load and blank-frame smoke test in this workspace; no accuracy validation; Pi 3 performance unverified"
+}
