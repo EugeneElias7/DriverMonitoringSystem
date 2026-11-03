@@ -8,6 +8,10 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Local logs and snapshots
+# Local logs, snapshots, and recorded previews
 *.log
+*.csv
 camera-test.jpg
+*.mp4
+*.avi
+*.mov

@@ -1,0 +1,88 @@
+{
+  "face": {
+    "detector_model_path": "models/face_detection_yunet_2023mar.onnx",
+    "landmark_model_path": "models/2d106det.onnx",
+    "min_detection_confidence": 0.2
+  },
+  "detectors": [
+    {
+      "name": "driver",
+      "model_path": "models/best.onnx",
+      "classes_path": "models/driver_classes.txt",
+      "classes_whitelist": [
+        "drinking",
+        "eating",
+        "seatbelt"
+      ],
+      "conf_threshold": 0.2,
+      "target_hz": 1.0,
+      "enabled": true
+    },
+    {
+      "name": "cigarette",
+      "model_path": "models/cigarette_smokers_v4.onnx",
+      "classes_path": "models/cigarette_v4_classes.txt",
+      "classes_whitelist": [
+        "cigarette"
+      ],
+      "conf_threshold": 0.45,
+      "target_hz": 0.5,
+      "enabled": true
+    },
+    {
+      "name": "phone",
+      "model_path": "models/phone_yolo11n.onnx",
+      "classes_path": "models/coco_classes.txt",
+      "classes_whitelist": [
+        "cell phone"
+      ],
+      "class_conf_overrides": {
+        "cell phone": 0.1
+      },
+      "conf_threshold": 0.1,
+      "target_hz": 0.5,
+      "enabled": true
+    }
+  ],
+  "thresholds": {
+    "ear_closed": 0.15,
+    "microsleep_s": 1.2,
+    "perclos_alert": 0.35,
+    "perclos_window_s": 4.0,
+    "yawn_mar": 0.55,
+    "yawn_s": 1.0,
+    "cigarette_s": 2.5,
+    "cigarette_high_conf": 0.6,
+    "cigarette_low_conf": 0.45,
+    "cigarette_low_s": 3.0,
+    "cigarette_hold_s": 3.0,
+    "cigarette_gate_span": 0.3,
+    "cigarette_max_size_span": 0.55,
+    "phone_low_conf": 0.15,
+    "phone_hand_conf": 0.2,
+    "phone_call_s": 1.5,
+    "phone_in_hand_s": 1.0,
+    "phone_hold_s": 3.0,
+    "seatbelt_check": false,
+    "yaw_away_deg": 999.0,
+    "pitch_away_deg": 999.0,
+    "eating_s": 999.0
+  },
+  "audio": {
+    "enabled": true,
+    "device": "plughw:Headphones"
+  },
+  "camera": {
+    "controls": {
+      "AwbEnable": false,
+      "ColourGains": [
+        1.2,
+        1.4
+      ]
+    }
+  },
+  "alert_cooldown_s": 2.5,
+  "capture_width": 640,
+  "capture_height": 480,
+  "display": true
+}

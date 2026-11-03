@@ -1,0 +1,7 @@
+# OpenCV-only runtime for the PC and the Raspberry Pi 3.
+#
+# Do not add mediapipe: its prebuilt ARM binary needs ARM AES instructions
+# that the Pi 3 Cortex-A53 lacks, and it dies with
+# "This binary was compiled with aes enabled" on first use.
+opencv-python>=4.9
+numpy>=1.24
