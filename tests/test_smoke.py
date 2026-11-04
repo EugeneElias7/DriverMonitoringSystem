@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 from pathlib import Path
 
 import numpy as np
 
+from dms.alerts import AlertManager, ConditionSignal, Severity
+from dms.audio import PriorityPlaylist
 from dms.config import AppConfig, Thresholds
 from dms.face import FaceObservation, OpenCvFaceAnalyzer
 from dms.behaviors import DistractionMonitor, DrowsinessMonitor, SmokingMonitor
-from dms.objects import Detection, YoloDetector
+from dms.objects import (
+    BackgroundDetector,
+    Detection,
+    DetectorGate,
+    YoloDetector,
+)
 from dms.temporal import Sustained
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +32,22 @@ class ConfigTests(unittest.TestCase):
                 cfg = AppConfig.load(ROOT / name)
                 self.assertTrue(cfg.detectors)
                 self.assertEqual(cfg.check_paths(ROOT), [])
+
+    def test_only_the_pi_profile_serializes_detectors(self) -> None:
+        pi = AppConfig.load(ROOT / "config_pi.json")
+        pc = AppConfig.load(ROOT / "config_pc.json")
+        self.assertTrue(pi.serialize_detectors)
+        self.assertFalse(pc.serialize_detectors)
+        self.assertTrue(pi.face_first)
+        self.assertFalse(pc.face_first)
+        self.assertEqual(pi.opencv_threads, 2)
+        # Detector order is the priority order; cigarette must be first.
+        self.assertEqual(pi.detectors[0].name, "cigarette")
+        # Sleep must confirm in about 1.5-2 s, not after 4-5 s, while still
+        # requiring a run of three fully closed frames.
+        self.assertLessEqual(pi.thresholds.microsleep_min_frames, 3)
+        self.assertLessEqual(pi.thresholds.microsleep_s, 1.2)
+        self.assertLess(pi.thresholds.ear_closed, 0.15)
 
 
 class TemporalTests(unittest.TestCase):
@@ -37,14 +62,19 @@ class TemporalTests(unittest.TestCase):
 
 class DrowsinessTests(unittest.TestCase):
     @staticmethod
-    def _face(ear: float = 0.28, mar: float = 0.05) -> FaceObservation:
+    def _face(
+        ear: float = 0.28,
+        mar: float = 0.05,
+        ear_left: float | None = None,
+        ear_right: float | None = None,
+    ) -> FaceObservation:
         return FaceObservation(
             present=True,
             bbox=(100.0, 100.0, 200.0, 220.0),
             mouth=(150.0, 180.0),
             ear=ear,
-            ear_left=ear,
-            ear_right=ear,
+            ear_left=ear if ear_left is None else ear_left,
+            ear_right=ear if ear_right is None else ear_right,
             mar=mar,
             yaw=5.0,
             pitch=5.0,
@@ -89,6 +119,49 @@ class DrowsinessTests(unittest.TestCase):
         for t in (0.0, 1.0, 2.0, 3.0):
             signals = monitor.update(t, self._face(ear=0.10))
             self.assertFalse(self._active(signals, "drowsy_perclos"))
+
+    def test_three_closed_frames_at_one_fps_alert_in_two_seconds(self) -> None:
+        monitor = DrowsinessMonitor(
+            Thresholds(
+                ear_closed=0.10,
+                microsleep_s=1.2,
+                microsleep_min_frames=3,
+            )
+        )
+        self.assertFalse(
+            self._active(monitor.update(0.0, self._face(ear=0.05)), "drowsy_microsleep")
+        )
+        self.assertFalse(
+            self._active(monitor.update(1.0, self._face(ear=0.05)), "drowsy_microsleep")
+        )
+        self.assertTrue(
+            self._active(monitor.update(2.0, self._face(ear=0.05)), "drowsy_microsleep")
+        )
+
+    def test_one_eye_artifact_does_not_count_as_closed(self) -> None:
+        monitor = DrowsinessMonitor(
+            Thresholds(microsleep_s=0.1, microsleep_min_frames=2)
+        )
+        for t in (0.0, 1.0, 2.0, 3.0):
+            signals = monitor.update(
+                t, self._face(ear=0.19, ear_left=0.08, ear_right=0.30)
+            )
+            self.assertFalse(self._active(signals, "drowsy_microsleep"))
+
+    def test_short_blink_does_not_reach_the_faster_bar(self) -> None:
+        monitor = DrowsinessMonitor(
+            Thresholds(microsleep_s=1.2, microsleep_min_frames=3)
+        )
+        # A 0.4 s blink spans two samples at 2.5 fps but not the 1.2 s bar.
+        self.assertFalse(
+            self._active(monitor.update(0.0, self._face(ear=0.05)), "drowsy_microsleep")
+        )
+        self.assertFalse(
+            self._active(monitor.update(0.4, self._face(ear=0.05)), "drowsy_microsleep")
+        )
+        self.assertFalse(
+            self._active(monitor.update(0.8, self._face(ear=0.30)), "drowsy_microsleep")
+        )
 
 
 class GateTests(unittest.TestCase):
@@ -146,6 +219,126 @@ class GateTests(unittest.TestCase):
         self.assertFalse(gate.update(12.0, self.face, [])[0].active)
         self.assertFalse(gate.update(13.0, self.face, [cigarette])[0].active)
         self.assertTrue(gate.update(14.0, self.face, [cigarette])[0].active)
+
+
+class DetectorSchedulingTests(unittest.TestCase):
+    @staticmethod
+    def _wait_for(predicate, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.002)
+        raise AssertionError("condition not reached before timeout")
+
+    def test_gate_serves_lower_priority_number_first(self) -> None:
+        gate = DetectorGate()
+        self.assertTrue(gate.acquire(0))
+        order: list[str] = []
+
+        def take(name: str, priority: int) -> None:
+            if gate.acquire(priority):
+                order.append(name)
+                gate.release()
+
+        phone = threading.Thread(target=take, args=("phone", 1))
+        cigarette = threading.Thread(target=take, args=("cigarette", 0))
+        phone.start()
+        self._wait_for(lambda: gate.waiting == 1)
+        cigarette.start()
+        self._wait_for(lambda: gate.waiting == 2)
+        gate.release()
+        phone.join(2.0)
+        cigarette.join(2.0)
+        self.assertFalse(phone.is_alive())
+        self.assertFalse(cigarette.is_alive())
+        self.assertEqual(order, ["cigarette", "phone"])
+
+    def test_serialized_workers_never_run_a_pass_concurrently(self) -> None:
+        state = {"lock": threading.Lock(), "current": 0, "peak": 0}
+
+        class SlowDetector:
+            enabled = True
+            name = "slow"
+
+            def detect(self, frame):
+                with state["lock"]:
+                    state["current"] += 1
+                    state["peak"] = max(state["peak"], state["current"])
+                time.sleep(0.04)
+                with state["lock"]:
+                    state["current"] -= 1
+                return []
+
+        gate = DetectorGate()
+        workers = [
+            BackgroundDetector(SlowDetector(), target_hz=20.0, gate=gate, priority=i)
+            for i in range(2)
+        ]
+        frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        for worker in workers:
+            worker.start()
+        for _ in range(10):
+            for worker in workers:
+                worker.submit(frame)
+            time.sleep(0.02)
+        for worker in workers:
+            worker.request_stop()
+        gate.close()
+        for worker in workers:
+            worker.stop()
+        self.assertEqual(state["peak"], 1)
+
+    def test_paused_worker_starts_no_new_pass(self) -> None:
+        state = {"lock": threading.Lock(), "count": 0}
+
+        class CountingDetector:
+            enabled = True
+            name = "counting"
+
+            def detect(self, frame):
+                with state["lock"]:
+                    state["count"] += 1
+                return []
+
+        worker = BackgroundDetector(CountingDetector(), target_hz=20.0)
+        worker.set_paused(True)
+        worker.start()
+        worker.submit(np.zeros((48, 64, 3), dtype=np.uint8))
+        time.sleep(0.2)
+        with state["lock"]:
+            self.assertEqual(state["count"], 0)
+        worker.set_paused(False)
+        self._wait_for(lambda: state["count"] > 0)
+        worker.stop()
+
+
+class AlertPriorityTests(unittest.TestCase):
+    def test_sleep_speaks_before_phone_before_smoking(self) -> None:
+        seen: list[str] = []
+        manager = AlertManager(sinks=[lambda alert: seen.append(alert.key)])
+        alerts = manager.update(
+            1.0,
+            [
+                ConditionSignal("smoking", Severity.MAJOR, "smoking", True),
+                ConditionSignal("phone_use", Severity.MAJOR, "phone", True),
+                ConditionSignal(
+                    "drowsy_microsleep", Severity.CRITICAL, "sleep", True
+                ),
+            ],
+        )
+        expected = ["drowsy_microsleep", "phone_use", "smoking"]
+        self.assertEqual([alert.key for alert in alerts], expected)
+        self.assertEqual(seen, expected)
+
+    def test_playlist_orders_by_priority_and_drops_least_urgent(self) -> None:
+        playlist = PriorityPlaylist(maxsize=2)
+        playlist.put(Path("stop_smoking.wav"), priority=30)
+        playlist.put(Path("please_take_a_break.wav"), priority=0)
+        playlist.put(Path("do_not_use_phone.wav"), priority=20)
+        self.assertEqual(playlist.get_nowait().name, "please_take_a_break.wav")
+        self.assertEqual(playlist.get_nowait().name, "do_not_use_phone.wav")
+        self.assertIsNone(playlist.get_nowait())
 
 
 class ModelTests(unittest.TestCase):

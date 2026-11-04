@@ -9,6 +9,7 @@ forward pass off the frame thread.
 
 from __future__ import annotations
 
+import heapq
 import threading
 import time
 from dataclasses import dataclass
@@ -257,6 +258,65 @@ class YoloDetector:
         return detections
 
 
+class DetectorGate:
+    """A priority gate that lets one model pass run at a time.
+
+    OpenCV DNN already uses every core, so two forward passes started at the
+    same time do not overlap for free: on a Pi 3 they contend until each takes
+    as long as running both back to back. Serializing them keeps a pass near
+    its isolated cost. Waiters are ordered by priority (lower first) so the
+    cigarette model gets the CPU before the phone model when both are ready.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        # (priority, ticket, token): the ticket breaks ties by arrival order.
+        self._waiters: list[tuple[int, int, object]] = []
+        self._next_ticket = 0
+        self._busy = False
+        self._closed = False
+
+    @property
+    def waiting(self) -> int:
+        with self._cond:
+            return len(self._waiters)
+
+    def acquire(self, priority: int = 0) -> bool:
+        """Wait for the gate, returning False if it closed before the turn."""
+        token = object()
+        with self._cond:
+            if self._closed:
+                return False
+            entry = (int(priority), self._next_ticket, token)
+            self._next_ticket += 1
+            heapq.heappush(self._waiters, entry)
+            while not self._closed and (
+                self._busy or self._waiters[0][2] is not token
+            ):
+                self._cond.wait()
+            if self._closed:
+                # A high-priority waiter may still be in the heap; remove it
+                # so a later close cannot leave a dangling ticket.
+                if entry in self._waiters:
+                    self._waiters.remove(entry)
+                    heapq.heapify(self._waiters)
+                self._cond.notify_all()
+                return False
+            heapq.heappop(self._waiters)
+            self._busy = True
+            return True
+
+    def release(self) -> None:
+        with self._cond:
+            self._busy = False
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
 class BackgroundDetector:
     """Runs detection on a worker thread and republishes the latest results.
 
@@ -266,9 +326,17 @@ class BackgroundDetector:
     result is fine — `results_at` lets the overlay expose its age.
     """
 
-    def __init__(self, detector, target_hz: float = 2.0):
+    def __init__(
+        self,
+        detector,
+        target_hz: float = 2.0,
+        gate: DetectorGate | None = None,
+        priority: int = 0,
+    ):
         self._detector = detector
         self._period = 1.0 / max(0.1, target_hz)
+        self._gate = gate
+        self._priority = int(priority)
         self._frame: np.ndarray | None = None
         self._frame_seq = 0
         self._lock = threading.Lock()
@@ -280,8 +348,14 @@ class BackgroundDetector:
         # a current frame as if they were live.
         self._results_at: float | None = None
         self._stop = threading.Event()
+        # Set by face-first scheduling. The worker keeps the latest frame but
+        # starts no new forward pass until it is cleared.
+        self._paused = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_latency_ms = 0.0
+        # Time spent queued behind another model pass, kept separate from the
+        # inference cost so the status line can show contention at a glance.
+        self.last_wait_ms = 0.0
         # The worker swallows exceptions so a bad pass cannot kill the loop;
         # this keeps the reason visible to the status line instead of leaving
         # detections silently empty.
@@ -289,7 +363,10 @@ class BackgroundDetector:
 
     @property
     def name(self) -> str:
-        return getattr(self._detector, "name", self._detector.source)
+        name = getattr(self._detector, "name", None)
+        if name:
+            return name
+        return getattr(self._detector, "source", "detector")
 
     def start(self) -> None:
         if not self._detector.enabled:
@@ -305,6 +382,13 @@ class BackgroundDetector:
         with self._lock:
             self._frame = frame_bgr.copy()
             self._frame_seq += 1
+
+    def set_paused(self, paused: bool) -> None:
+        """Stop starting new passes while the face path needs the CPU."""
+        if paused:
+            self._paused.set()
+        else:
+            self._paused.clear()
 
     @property
     def latest(self) -> list[Detection]:
@@ -325,29 +409,65 @@ class BackgroundDetector:
     def _run(self) -> None:
         processed = 0
         while not self._stop.is_set():
+            if self._paused.is_set():
+                # Face-first scheduling is active; poll so a resume is picked
+                # up quickly without spinning.
+                self._stop.wait(0.05)
+                continue
             with self._lock:
                 frame, seq = self._frame, self._frame_seq
             if frame is None or seq == processed:
                 self._stop.wait(self._period)
                 continue
-            processed = seq
-            started = time.perf_counter()
+
+            waited_from = time.perf_counter()
+            if self._gate is not None and not self._gate.acquire(self._priority):
+                break
             try:
-                results = self._detector.detect(frame)
-            except Exception as exc:  # keep the loop alive; a dropped pass is harmless
-                results = []
-                self.last_error = f"{type(exc).__name__}: {exc}"
-            else:
-                self.last_error = None
-            self.last_latency_ms = (time.perf_counter() - started) * 1000.0
-            with self._lock:
-                self._results = results
-                self._results_seq += 1
-                self._results_at = time.monotonic()
+                # The gate may have kept this worker waiting behind a long
+                # phone pass. Use the newest frame instead of the one that was
+                # current before the wait, otherwise the result describes a
+                # scene that is already seconds old on the Pi.
+                with self._lock:
+                    frame, seq = self._frame, self._frame_seq
+                if self._stop.is_set():
+                    break
+                if self._paused.is_set():
+                    # The eyes closed while this worker was queued. Release
+                    # the gate without spending a pass on stale face state.
+                    continue
+                if frame is None or seq == processed:
+                    # Nothing newer arrived while queued. Rest below instead
+                    # of sleeping here, which would hold the gate for a whole
+                    # target period and block the other detector.
+                    pass
+                else:
+                    processed = seq
+                    self.last_wait_ms = (time.perf_counter() - waited_from) * 1000.0
+                    started = time.perf_counter()
+                    try:
+                        results = self._detector.detect(frame)
+                    except Exception as exc:  # keep the loop alive; a dropped pass is harmless
+                        results = []
+                        self.last_error = f"{type(exc).__name__}: {exc}"
+                    else:
+                        self.last_error = None
+                    self.last_latency_ms = (time.perf_counter() - started) * 1000.0
+                    with self._lock:
+                        self._results = results
+                        self._results_seq += 1
+                        self._results_at = time.monotonic()
+            finally:
+                if self._gate is not None:
+                    self._gate.release()
             self._stop.wait(self._period)
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        """Ask the worker to exit without waiting for the pass in flight."""
         self._stop.set()
+
+    def stop(self) -> None:
+        self.request_stop()
         if self._thread is not None:
             # Wait for the pass in flight instead of timing out after 2 s: a
             # 640x640 forward takes ~5 s on a Pi 3, and exiting while OpenCV

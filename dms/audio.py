@@ -8,7 +8,7 @@ espeak on Linux) when the WAV files are missing.
 
 from __future__ import annotations
 
-import queue as _queue
+import heapq
 import shutil
 import subprocess
 import sys
@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from .alerts import Alert
+from .alerts import Alert, priority_for
 
 # Alert key -> (spoken phrase, wav file name). The three drowsy stages
 # share one phrase.
@@ -114,34 +114,82 @@ def _pick_tts() -> Callable[[str], None] | None:
     return None
 
 
+class PriorityPlaylist:
+    """Pending WAV phrases ordered by alert priority (lowest number first).
+
+    Ties keep arrival order. If the backlog is full, the least urgent phrase
+    is dropped rather than a more important one that arrived later.
+    """
+
+    def __init__(self, maxsize: int = 6) -> None:
+        self.maxsize = max(1, int(maxsize))
+        self._items: list[tuple[int, int, Path]] = []
+        self._seq = 0
+        self._cond = threading.Condition()
+        self._closed = False
+
+    def put(self, path: Path, priority: int = 100) -> None:
+        with self._cond:
+            if self._closed:
+                return
+            heapq.heappush(self._items, (int(priority), self._seq, Path(path)))
+            self._seq += 1
+            while len(self._items) > self.maxsize:
+                worst = max(self._items, key=lambda item: (item[0], item[1]))
+                self._items.remove(worst)
+                heapq.heapify(self._items)
+            self._cond.notify()
+
+    def get(self) -> Path | None:
+        """Block for the next phrase; None means the playlist was closed."""
+        with self._cond:
+            while not self._items and not self._closed:
+                self._cond.wait()
+            if not self._items:
+                return None
+            return heapq.heappop(self._items)[2]
+
+    def get_nowait(self) -> Path | None:
+        with self._cond:
+            if not self._items:
+                return None
+            return heapq.heappop(self._items)[2]
+
+    def flush(self) -> None:
+        with self._cond:
+            self._items.clear()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._items.clear()
+            self._cond.notify_all()
+
+    def __len__(self) -> int:
+        with self._cond:
+            return len(self._items)
+
+
 class _WavePlayer:
     """Serializes WAV playback on a worker thread.
 
     Playing synchronously on a dedicated thread means every phrase runs to
     completion and alerts that land close together queue back-to-back,
-    instead of the OS cancelling the sound in progress.
+    instead of the OS cancelling the sound in progress. Pending phrases are
+    held in a priority queue, so a sleep warning goes next even if a phone
+    phrase arrived first. A phrase already being spoken is not interrupted.
     """
 
     def __init__(self, play: Callable[[Path], None]) -> None:
         self._play = play
-        self._queue: _queue.Queue[Path | None] = _queue.Queue(maxsize=4)
+        self._queue = PriorityPlaylist()
         self._thread = threading.Thread(
             target=self._run, name="drivermon-audio", daemon=True
         )
         self._thread.start()
 
-    def play(self, path: Path) -> None:
-        try:
-            self._queue.put_nowait(path)
-        except _queue.Full:
-            try:
-                self._queue.get_nowait()  # drop the oldest backlog entry
-            except _queue.Empty:
-                pass
-            try:
-                self._queue.put_nowait(path)
-            except _queue.Full:
-                pass
+    def play(self, path: Path, priority: int = 100) -> None:
+        self._queue.put(path, priority)
 
     def flush(self) -> None:
         """Drop backlog phrases that have not started playing yet.
@@ -150,18 +198,10 @@ class _WavePlayer:
         not possible with the sync backends, and one trailing phrase after
         a condition clears is acceptable ("stop with one extra").
         """
-        while True:
-            try:
-                self._queue.get_nowait()
-            except _queue.Empty:
-                return
+        self._queue.flush()
 
     def close(self) -> None:
-        self.flush()
-        try:
-            self._queue.put(None, timeout=1.0)
-        except _queue.Full:
-            pass
+        self._queue.close()
         self._thread.join(timeout=2.0)
 
     def _run(self) -> None:
@@ -205,9 +245,9 @@ class AudioAlerter:
             return
         phrase = phrase_for(alert)
         if phrase is not None:
-            self.speak(phrase)
+            self.speak(phrase, priority=priority_for(alert.key))
 
-    def speak(self, phrase: str) -> None:
+    def speak(self, phrase: str, priority: int = 100) -> None:
         filename = next(
             (name for text, name in SPOKEN.values() if text == phrase), None
         )
@@ -216,7 +256,7 @@ class AudioAlerter:
         wav = self._wav_dir / filename
         if self._player is not None and wav.exists():
             print(f"speaking: {phrase}", flush=True)
-            self._player.play(wav)
+            self._player.play(wav, priority)
             return
         if self._tts is not None:
             print(f"speaking: {phrase}", flush=True)

@@ -13,7 +13,7 @@
         "cigarette"
       ],
       "conf_threshold": 0.45,
-      "target_hz": 0.5,
+      "target_hz": 2.0,
       "enabled": true
     },
     {
@@ -27,12 +27,12 @@
         "cell phone": 0.1
       },
       "conf_threshold": 0.1,
-      "target_hz": 0.5,
+      "target_hz": 0.1,
       "enabled": true
     }
   ],
   "thresholds": {
-    "ear_closed": 0.15,
+    "ear_closed": 0.1,
     "microsleep_s": 1.2,
     "perclos_alert": 0.35,
     "perclos_window_s": 4.0,
@@ -40,11 +40,11 @@
     "yawn_s": 1.0,
     "microsleep_min_frames": 3,
     "perclos_min_samples": 10,
-    "cigarette_s": 2.5,
+    "cigarette_s": 1.0,
     "cigarette_high_conf": 0.6,
     "cigarette_low_conf": 0.45,
-    "cigarette_low_s": 3.0,
-    "cigarette_hold_s": 3.0,
+    "cigarette_low_s": 1.5,
+    "cigarette_hold_s": 4.0,
     "cigarette_gate_span": 0.24,
     "cigarette_max_size_span": 0.5,
     "cigarette_min_aspect": 1.15,
@@ -75,5 +75,9 @@
   "alert_cooldown_s": 5.0,
   "capture_width": 640,
   "capture_height": 480,
+  "target_fps": 5,
+  "opencv_threads": 2,
+  "serialize_detectors": true,
+  "face_first": true,
   "display": true
 }

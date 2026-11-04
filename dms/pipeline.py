@@ -30,6 +30,7 @@ from .objects import (
     PHONE_LABELS,
     BackgroundDetector,
     Detection,
+    DetectorGate,
     YoloDetector,
     merge_detections,
 )
@@ -51,13 +52,38 @@ class Perception:
 
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
+        if cfg.opencv_threads > 0:
+            cv2.setNumThreads(int(cfg.opencv_threads))
         self.face = create_face_analyzer(cfg.face)
         self.detectors = [YoloDetector(det_cfg) for det_cfg in cfg.detectors]
+        # Serializing is only useful when there is more than one model. The
+        # detector order is the priority order: cigarette is listed first in
+        # config_pi.json, so it gets the next free pass before phone.
+        self._gate = DetectorGate() if cfg.serialize_detectors else None
+        self._detectors_paused = False
         self.workers = [
-            BackgroundDetector(detector, detector.cfg.target_hz)
-            for detector in self.detectors
+            BackgroundDetector(
+                detector,
+                detector.cfg.target_hz,
+                gate=self._gate,
+                priority=index,
+            )
+            for index, detector in enumerate(self.detectors)
             if detector.enabled
         ]
+
+    @property
+    def detectors_paused(self) -> bool:
+        return self._detectors_paused
+
+    def set_detectors_paused(self, paused: bool) -> None:
+        """Face-first switch: stop starting detector passes while true."""
+        paused = bool(paused)
+        if paused == self._detectors_paused:
+            return
+        self._detectors_paused = paused
+        for worker in self.workers:
+            worker.set_paused(paused)
 
     @property
     def labels(self) -> list[str]:
@@ -151,6 +177,13 @@ class Perception:
         )
 
     def close(self) -> None:
+        # Wake every worker before joining: one may be queued on the gate
+        # while another is inside a multi-second pass, and the stop event
+        # alone does not wake a condition wait.
+        for worker in self.workers:
+            worker.request_stop()
+        if self._gate is not None:
+            self._gate.close()
         for worker in self.workers:
             worker.stop()
         for detector in self.detectors:

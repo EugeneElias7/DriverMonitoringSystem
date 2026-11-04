@@ -179,6 +179,19 @@ class AppConfig:
     capture_width: int = 640
     capture_height: int = 480
     target_fps: int = 15
+    # Global OpenCV CPU thread cap. 0 keeps OpenCV's default. On a Pi 3 the
+    # face path is faster at 2-3 threads than at 4, and leaving a core free
+    # keeps face/drowsiness frames arriving while a YOLO pass runs.
+    opencv_threads: int = 0
+    # Run at most one detector forward pass at a time, in detector-list order
+    # (lowest index first). OpenCV DNN saturates every core, so on a Pi 3 two
+    # concurrent passes each take as long as running both back to back. This
+    # keeps each pass near its isolated cost; the PC has cores to spare.
+    serialize_detectors: bool = False
+    # Face-first scheduling: while the eyes are closed or the face is missing,
+    # stop starting detector passes so the CPU goes to the face/drowsiness
+    # path. A pass already in flight finishes; it is not interrupted.
+    face_first: bool = False
     # Repeat cadence for a condition that stays active: the warning (voice,
     # console, log) fires again every N seconds until the condition clears.
     alert_cooldown_s: float = 2.5

@@ -66,7 +66,21 @@ class DrowsinessMonitor:
                 return self._signals(now, absent, 0.0, False, False, False)
             return self._signals(now, False, 0.0, False, False, False)
 
-        closed = face.ear < th.ear_closed
+        # Both eyelids must be shut. A single-eye landmark glitch can drag the
+        # averaged EAR down while the driver is awake, so the average alone is
+        # not enough. Scripted sources leave the per-eye values NaN; in that
+        # case fall back to the average.
+        closed = (
+            face.ear < th.ear_closed
+            and (
+                not math.isfinite(face.ear_left)
+                or face.ear_left < th.ear_closed
+            )
+            and (
+                not math.isfinite(face.ear_right)
+                or face.ear_right < th.ear_closed
+            )
+        )
         self._closed_run = self._closed_run + 1 if closed else 0
         self._perclos.push(now, face.ear)
         self._track_blink(now, closed)
@@ -151,6 +165,17 @@ class DrowsinessMonitor:
                 yawning,
             ),
         ]
+
+    @property
+    def eyes_closed(self) -> bool:
+        """True while the current run of closed-eye frames is unbroken.
+
+        The app uses this as a face-first scheduling signal: while it is true
+        the detector workers stop starting new passes, so the next face frame
+        (which confirms or clears the microsleep) is produced as soon as
+        possible.
+        """
+        return self._closed_run > 0
 
     @property
     def blink_median(self) -> float:

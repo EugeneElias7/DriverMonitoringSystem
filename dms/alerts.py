@@ -17,6 +17,25 @@ class Severity(IntEnum):
     CRITICAL = 4
 
 
+# Spoken-alert priority: lower numbers are handled first. A sleeping driver
+# outranks every object warning; when phone and smoking are both active, the
+# phone warning speaks before the cigarette one. Status-only keys stay at the
+# default because they have no sound.
+ALERT_PRIORITIES: dict[str, int] = {
+    "drowsy_microsleep": 0,
+    "drowsy_perclos": 0,
+    "drowsy_yawning": 10,
+    "driver_absent": 15,
+    "phone_use": 20,
+    "smoking": 30,
+}
+_DEFAULT_PRIORITY = 100
+
+
+def priority_for(key: str) -> int:
+    return ALERT_PRIORITIES.get(key, _DEFAULT_PRIORITY)
+
+
 @dataclass(frozen=True)
 class ConditionSignal:
     """A monitor's current view of one condition.
@@ -82,6 +101,18 @@ class AlertManager:
             alert = Alert(signal.key, signal.severity, signal.message, now)
             self._last_emit[signal.key] = now
             emitted.append(alert)
+
+        # Several conditions can rise on the same frame. Deliver the most
+        # urgent one first (drowsiness, then phone, then smoking), so the
+        # speaker and the log never bury a sleep warning behind an object.
+        emitted.sort(
+            key=lambda alert: (
+                priority_for(alert.key),
+                -int(alert.severity),
+                alert.timestamp,
+            )
+        )
+        for alert in emitted:
             for sink in self._sinks:
                 sink(alert)
         return emitted

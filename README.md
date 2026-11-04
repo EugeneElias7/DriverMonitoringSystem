@@ -20,9 +20,12 @@ Pi 3 lacks). Object detection is OpenCV DNN over ONNX YOLO models.
 | Head    | looking away from the road             | status only           |
 
 The spoken warnings repeat every `alert_cooldown_s` (2.5 s on the PC, 5 s on
-the Pi) while the condition stays active. Smoking and phone conditions are
-held through a missed detector pass, so a dropped frame does not silence a
-warning. The alert stops when the condition clears.
+the Pi) while the condition stays active. When several conditions rise at
+once the order is fixed: drowsiness first, then phone, then smoking. A phrase
+already being spoken is allowed to finish; pending phrases are held in a
+priority queue. Smoking and phone conditions are held through a missed
+detector pass, so a dropped frame does not silence a warning. The alert stops
+when the condition clears.
 
 The preview shows:
 
@@ -95,10 +98,11 @@ The runtime expects the Ultralytics detection layout
 The dedicated cigarette model is the only source of cigarette detections.
 `best.onnx` still lists a cigarette class but it is masked out: on webcam
 footage it produced false boxes, including occasional full-frame ones. The
-dedicated model runs on both PC and Pi; `config_pi.json` samples it at 0.5 Hz
-and lengthens the confirmation time accordingly. The Pi profile also drops the
-`best.onnx` detector entirely: drinking, eating and seatbelt are status-only,
-and a third 640-pixel pass costs another ~2.5 s on the Cortex-A53.
+dedicated model runs on both PC and Pi. `config_pi.json` gives it a 2 Hz
+start-to-start target; the pass itself is CPU-bound, so the effective cadence
+is about one pass plus a short rest. The Pi profile also drops the `best.onnx`
+detector entirely: drinking, eating and seatbelt are status-only, and a third
+640-pixel pass costs another ~2.5 s on the Cortex-A53.
 
 ## Run on the PC
 
@@ -136,12 +140,24 @@ Run it from the Pi desktop for the preview window. Over SSH add `--headless`;
 the app probes the display first and falls back to headless instead of hanging
 when XWayland is not reachable from the session.
 
-`config_pi.json` enables only the cigarette and phone detectors. On this Pi 3
-a cigarette pass takes ~5-6 s and a phone pass ~6-7 s, with about one processed
-frame per second headless (roughly half that with the preview window) and
-~420 MB resident memory. Alerts still fire 1-3 s after the confirming detection
-because the last result is held between passes; boxes older than 1.5 s are
-marked `STALE`.
+`config_pi.json` enables only the cigarette and phone detectors. The Pi
+profile also:
+
+- serializes detector passes through a priority gate, so two YOLO forwards
+  never fight over the four Cortex-A53 cores;
+- caps OpenCV at `opencv_threads: 2`, which leaves cores for the face path;
+- captures at `target_fps: 5`, enough for the face loop without running the
+  camera pipeline flat out;
+- uses face-first scheduling (`face_first: true`): the moment the eyes close
+  or the face disappears, detector workers stop starting new passes until the
+  face is back. A pass already in flight finishes, but it cannot delay the
+  confirming face frame by another whole pass.
+
+Measured headless on this Pi 3: ~1.3 processed frames/s, ~2.1 s for one
+cigarette pass at the full 1.2 GHz clock, 3.9-5.0 s while the board is
+actively throttled to 600 MHz, and ~410 MB resident memory. Detector results
+are held between passes, so the overlay marks boxes older than 1.5 s as
+`STALE`.
 
 The CSI night-vision module (OV5647 without an IR-cut filter) renders daylight
 magenta under auto white balance. `config_pi.json` disables AWB and fixes
@@ -154,9 +170,47 @@ rpicam-still --nopreview --width 640 --height 480 --timeout 1200 \
   --awbgains 0.95,1.00 -o /tmp/test.jpg
 ```
 
-`vcgencmd get_throttled` must read `0x0`. This Pi currently reports `0x50005`
-(under-voltage and active throttling), so use a 5 V 2.5 A supply with a short
-cable; otherwise model latency, temperature and camera stability suffer.
+### Power supply check
+
+The Pi 3 has no input-voltage sensor, so use both the firmware flags and a
+multimeter:
+
+```bash
+vcgencmd get_throttled        # must be 0x0
+vcgencmd measure_clock arm    # should stay 1200000000 under load
+vcgencmd measure_temp
+dmesg | grep -i -E 'voltage|throttl'
+```
+
+Run those in a loop while the app is working:
+
+```bash
+for i in $(seq 1 30); do
+  date +%T; vcgencmd get_throttled; vcgencmd measure_clock arm; sleep 2
+done
+```
+
+`0x50005` means under-voltage is happening **now** (bit 0), the ARM clock is
+capped (bit 2), and both have happened before (bits 16 and 18). The board then
+drops from 1.2 GHz to 600 MHz, which roughly doubles every inference pass. The
+software cannot compensate for that; measured pass times alternate between
+~2.1 s and ~4.2 s for exactly this reason.
+
+Measure the 5 V rail with a multimeter between TP1 (5 V) and TP2 (GND) on the
+board, or GPIO pin 2/4 and pin 6, **while the app is running**. It must stay at
+or above 4.8 V; 5.0-5.1 V is the target. `vcgencmd measure_volts core` is the
+SoC core rail (~1.2 V), not the 5 V input, so it cannot diagnose the supply.
+
+A 12 V adapter with a buck converter can work, but the converter must be rated
+for 5 V at 3 A continuous (15 W) and the 12 V adapter for at least 2 A (24 W)
+to leave margin. Many small buck modules are only 2 A, and thin or long wires
+and a poor micro-USB cable drop the rest. Set the converter to 5.1 V measured
+at the Pi under load, use short 20 AWG (or thicker) leads, and check the
+voltage at both ends of the cable. If it still sags, replace the converter or
+the cable. The simplest known-good fix is a Raspberry Pi 5.1 V 2.5 A supply
+(or a good 5 V 3 A micro-USB supply) with a short cable. Powering through the
+GPIO 5 V pins bypasses the micro-USB connector and polyfuse, but only do that
+with a regulated 5.1 V supply, a fuse, and correct polarity.
 
 Use `--source 0` for a USB webcam. Do **not** install MediaPipe on the Pi 3:
 the OpenCV face path is the supported path.
@@ -193,6 +247,7 @@ Windows or `espeak`/`espeak-ng` on Linux.
   `face.min_detection_confidence`
 - `detectors[]`: `name`, `model_path`, `classes_path`, `conf_threshold`,
   `class_conf_overrides`, `target_hz`, `enabled`
+- `target_fps`, `opencv_threads`, `serialize_detectors`, `face_first`
 - `thresholds.cigarette_s`, `cigarette_high_conf`, `cigarette_low_conf`,
   `cigarette_low_s`, `cigarette_gate_span`, `cigarette_max_size_span`,
   `cigarette_min_aspect`, `cigarette_mouth_pad_span`
@@ -209,19 +264,23 @@ and stay detected for 1.0 s at confidence 0.60+ (or 1.5 s at 0.45+). The
 dedicated model runs at 2 Hz there, so this spans at least two detector
 passes. The Pi profile tightens the geometry to 0.24 / 0.50 face-heights,
 requires an elongated box (aspect ≥ 1.15) whose mouth pad is ≤ 0.12
-face-heights, and waits 2.5 s / 3.0 s because the model runs at 0.5 Hz. A real
-puff stays at the lips long enough to alert; a watch, ring or pen on the
-cheek does not pass the geometry.
+face-heights, and uses the same 1.0 s / 1.5 s confirmation with a 4 s hold.
+A real puff stays at the lips long enough to alert; a watch, ring or pen on
+the cheek does not pass the geometry.
 
 A disabled detector does not need its model or class file to exist, so a
 profile can drop a model without deleting files.
 
 Drowsiness ignores frames with an impossible EAR (> 0.50), an implausible MAR
 (> 1.20) or an extreme head pose, which is what a hand over the face produces.
-It also needs `microsleep_min_frames` consecutive closed samples (3), and
-PERCLOS needs `perclos_min_samples` samples in the window (10). On a 1 fps Pi
-the PERCLOS ratio is therefore not reported at all instead of firing on three
-noisy samples; microsleep still works from a genuine run of closed eyes.
+The Pi profile needs 3 consecutive closed samples, both eyelids below 0.10,
+and 1.2 s, so a real closure alerts in roughly 1.5-2 s at 1-2 fps; a normal
+0.2-0.4 s blink does not reach the bar, and a one-eye landmark glitch cannot
+start the run. Face-first scheduling pauses detector passes as soon as a
+closed run starts, which is what keeps those samples coming quickly.
+PERCLOS still needs `perclos_min_samples` samples (10) in its window, so on a
+1-2 fps Pi it stays quiet instead of firing on a handful of noisy samples;
+microsleep remains the fast path.
 
 ## Tests
 
@@ -233,14 +292,23 @@ python -m unittest discover -s tests -v
 
 The tests load both configs, check that the model files exist, run the face
 and object models once on a blank frame, and cover the alert hold, the
-drowsiness validity/run guards, and the cigarette geometry gates.
+drowsiness validity/run guards, the both-eyes 3-frame bar, the cigarette
+geometry gates, detector serialization/pause, and the alert/audio priority
+order.
 
 ## Notes and limits
 
 - Object detectors run on background threads, so a slow Pi does not freeze the
-  face loop. Each detector has its own `target_hz`.
-- Measured on this Pi 3: ~1 processed frame/s, 5-7 s per 640-pixel YOLO pass,
-  ~420 MB resident memory, 55-60 °C. The CPU is the limit, not RAM or disk.
+  face loop. Each detector has its own `target_hz`; on the Pi one shared gate
+  serializes passes, and face-first scheduling pauses new passes while the
+  eyes are closed or no face is visible.
+- The face path is the priority. Alert audio is held in a priority queue with
+  drowsiness first, phone second, smoking third. A phrase already playing is
+  not interrupted, so the worst extra delay is one ~1.9 s phrase.
+- Measured on this Pi 3: ~1.3 processed frames/s headless, ~2.1 s per
+  640-pixel cigarette pass at 1.2 GHz (3.9-5.0 s while actively throttled),
+  ~410 MB resident memory, 50-64 °C. The CPU and the 5 V supply are the
+  limits, not RAM or disk.
 - The preview window is optional. If highgui cannot open a display, the app
   prints a note and continues headless instead of blocking.
 - The models are trained for a driver-facing camera. A laptop webcam is a

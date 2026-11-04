@@ -209,9 +209,16 @@ def _status_line(
     if perception is not None and perception.workers:
         stats = " ".join(
             f"{worker.name}={worker.last_latency_ms:.0f}ms"
+            + (
+                f"/wait{worker.last_wait_ms:.0f}ms"
+                if perception.cfg.serialize_detectors
+                else ""
+            )
             for worker in perception.workers
         )
         parts.append(f"detectors={stats}")
+        if perception.detectors_paused:
+            parts.append("detectors_paused=yes")
         if observation.det_age is not None:
             stale = " STALE" if observation.det_age > _STALE_DETECTION_S else ""
             parts.append(f"det_age={observation.det_age:.1f}s{stale}")
@@ -540,6 +547,14 @@ def run(
 
             alerts = analyzer.update(observation)
             emitted.update(alert.key for alert in alerts)
+            if cfg.face_first and perception is not None:
+                # Eyes closed or no face: stop starting YOLO passes and give
+                # the CPU to the next face frame. A pass already in flight
+                # finishes, but the next one waits until the face is back.
+                perception.set_detectors_paused(
+                    not observation.face.present
+                    or analyzer.drowsiness.eyes_closed
+                )
             frame_count += 1
 
             if audio is not None and not any(
