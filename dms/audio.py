@@ -49,7 +49,7 @@ def _pick_wav_player(device: str = "") -> Callable[[Path], None] | None:
                 # finishes, so every word is heard before the next one.
                 winsound.PlaySound(
                     str(path),
-                    winsound.SND_FILENAME | winsound.SND_SYNC | winsound.SND_NODEFAULT,
+                    winsound.SND_FILENAME | winsound.SND_NODEFAULT,
                 )
 
             return play
