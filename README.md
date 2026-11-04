@@ -136,13 +136,19 @@ Double-click the **DMS** desktop icon, or run one command:
 
 ```bash
 cd /home/sansolution/dms
-./start.sh
+.venv/bin/python run.py --config config_pi.json --source picamera
 ```
 
-Over SSH the same command runs headless automatically. The app probes the
-display first and falls back to headless instead of hanging when XWayland is
-not reachable from the session. Pass normal app flags after the script, e.g.
-`./start.sh --max-seconds 60`.
+Over SSH add `--headless`:
+
+```bash
+cd /home/sansolution/dms
+.venv/bin/python run.py --config config_pi.json --source picamera --headless
+```
+
+The app probes the display first and falls back to headless instead of hanging
+when XWayland is not reachable from the session. Pass normal app flags after
+the command, e.g. `--max-seconds 60`.
 
 The test suite lives in the source tree on the PC; the Pi deployment keeps
 only the runtime files.
@@ -167,7 +173,7 @@ profile also:
 
 Measured headless on this Pi 3: ~1.5 processed frames/s, ~1.8 s for one
 cigarette pass at the full 1.2 GHz clock with 2 threads, roughly double that
-while the board is actively throttled to 600 MHz, and ~410 MB resident
+while the board is actively throttled to 600 MHz, and ~287 MB resident
 memory. Three threads measured 2.1-2.4 s per pass and caused a larger current
 spike, so the Pi profile uses two. Detector results are held between passes,
 so the overlay marks boxes older than 1.5 s as `STALE`.
@@ -329,7 +335,7 @@ order.
   not interrupted, so the worst extra delay is one ~1.9 s phrase.
 - Measured on this Pi 3: ~1.5 processed frames/s headless, ~1.8 s per
   640-pixel cigarette pass at 1.2 GHz with 2 threads (roughly double while
-  actively throttled), ~410 MB resident memory, 50-64 °C. Three threads were
+  actively throttled), ~287 MB resident memory, 50-64 °C. Three threads were
   slower and drew a larger current spike. The CPU and the 5 V supply are the
   limits, not RAM or disk.
 - Object latency is set by the two 640-pixel passes sharing one gate: each
