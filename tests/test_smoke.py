@@ -9,7 +9,7 @@ import numpy as np
 
 from dms.config import AppConfig, Thresholds
 from dms.face import FaceObservation, OpenCvFaceAnalyzer
-from dms.behaviors import DistractionMonitor, SmokingMonitor
+from dms.behaviors import DistractionMonitor, DrowsinessMonitor, SmokingMonitor
 from dms.objects import Detection, YoloDetector
 from dms.temporal import Sustained
 
@@ -33,6 +33,62 @@ class TemporalTests(unittest.TestCase):
         self.assertTrue(condition.update(1.5, False))
         self.assertTrue(condition.update(2.9, False))   # 1.9 s gap, still held
         self.assertFalse(condition.update(3.1, False))  # 2.1 s gap, released
+
+
+class DrowsinessTests(unittest.TestCase):
+    @staticmethod
+    def _face(ear: float = 0.28, mar: float = 0.05) -> FaceObservation:
+        return FaceObservation(
+            present=True,
+            bbox=(100.0, 100.0, 200.0, 220.0),
+            mouth=(150.0, 180.0),
+            ear=ear,
+            ear_left=ear,
+            ear_right=ear,
+            mar=mar,
+            yaw=5.0,
+            pitch=5.0,
+        )
+
+    @staticmethod
+    def _active(signals, key: str) -> bool:
+        return next(s.active for s in signals if s.key == key)
+
+    def test_impossible_landmark_values_are_ignored(self) -> None:
+        monitor = DrowsinessMonitor(Thresholds(microsleep_s=0.5))
+        # Hand over the face: the landmark model reports an EAR no open or
+        # closed eye can produce. It must not count as a closed eyelid.
+        for t in (0.0, 1.0, 2.0, 3.0):
+            signals = monitor.update(t, self._face(ear=0.80))
+            self.assertFalse(self._active(signals, "drowsy_microsleep"))
+            self.assertFalse(self._active(signals, "driver_absent"))
+
+    def test_microsleep_needs_a_run_of_closed_samples(self) -> None:
+        monitor = DrowsinessMonitor(
+            Thresholds(microsleep_s=0.1, microsleep_min_frames=3)
+        )
+        self.assertFalse(
+            self._active(monitor.update(0.0, self._face(ear=0.08)), "drowsy_microsleep")
+        )
+        self.assertFalse(
+            self._active(monitor.update(1.0, self._face(ear=0.08)), "drowsy_microsleep")
+        )
+        self.assertTrue(
+            self._active(monitor.update(2.0, self._face(ear=0.08)), "drowsy_microsleep")
+        )
+
+    def test_perclos_is_suppressed_when_samples_are_too_sparse(self) -> None:
+        monitor = DrowsinessMonitor(
+            Thresholds(
+                microsleep_s=100.0,
+                perclos_window_s=4.0,
+                perclos_alert=0.35,
+                perclos_min_samples=10,
+            )
+        )
+        for t in (0.0, 1.0, 2.0, 3.0):
+            signals = monitor.update(t, self._face(ear=0.10))
+            self.assertFalse(self._active(signals, "drowsy_perclos"))
 
 
 class GateTests(unittest.TestCase):
@@ -64,6 +120,22 @@ class GateTests(unittest.TestCase):
         below_chin = Detection("cigarette", 0.9, (145, 220, 165, 240))
         self.assertFalse(gate._near_face(phone_sized, self.face))
         self.assertFalse(gate._near_face(below_chin, self.face))
+
+    def test_pi_gate_rejects_round_watch_and_far_cheek_box(self):
+        gate = SmokingMonitor(
+            Thresholds(
+                cigarette_gate_span=0.24,
+                cigarette_max_size_span=0.5,
+                cigarette_min_aspect=1.15,
+                cigarette_mouth_pad_span=0.12,
+            )
+        )
+        round_watch = Detection("cigarette", 0.9, (145, 170, 165, 190))
+        cheek = Detection("cigarette", 0.8, (140, 140, 160, 150))
+        at_lips = Detection("cigarette", 0.8, (135, 170, 165, 180))
+        self.assertFalse(gate._near_face(round_watch, self.face))
+        self.assertFalse(gate._near_face(cheek, self.face))
+        self.assertTrue(gate._near_face(at_lips, self.face))
 
     def test_smoking_does_not_alert_on_one_short_flicker(self):
         gate = SmokingMonitor(Thresholds())

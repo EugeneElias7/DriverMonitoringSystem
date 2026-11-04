@@ -225,6 +225,31 @@ def _status_line(
     return " ".join(parts)
 
 
+def _display_works() -> bool:
+    """Check highgui in a subprocess first.
+
+    On the Pi, OpenCV's Qt backend can block forever inside `imshow` when
+    DISPLAY points at an XWayland socket the SSH session cannot use. A probe
+    with a hard timeout turns that hang into a clean "run headless" fallback.
+    """
+    script = (
+        "import cv2, numpy as np; "
+        "cv2.imshow('probe', np.zeros((64, 64, 3), np.uint8)); "
+        "cv2.waitKey(50); cv2.destroyAllWindows()"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            # The first `import cv2` alone can take several seconds on a
+            # Pi 3; the timeout is for a genuine highgui hang, not startup.
+            timeout=12.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
 def _power_note() -> str | None:
     """A Pi on a weak supply throttles, which doubles every model's latency."""
     try:
@@ -441,6 +466,13 @@ def run(
     cap: cv2.VideoCapture | PicameraCapture | None = None
     recorder: AnnotatedRecorder | None = None
     show = cfg.display
+    if show and sys.platform != "win32" and not _display_works():
+        print(
+            "note: no usable display from this session; running headless "
+            "(launch from the Pi desktop for the preview window)",
+            flush=True,
+        )
+        show = False
     emitted: Counter[str] = Counter()
     frame_count = 0
     fps = 0.0

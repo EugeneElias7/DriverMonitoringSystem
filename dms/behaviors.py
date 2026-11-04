@@ -31,6 +31,7 @@ class DrowsinessMonitor:
         self._yawn = Sustained(thresholds.yawn_s)
         self._absent = Sustained(thresholds.face_missing_s)
         self._closed_prev = False
+        self._closed_run = 0
         self._blink_start: float | None = None
         self._nod_start: float | None = None
         self._neutral_pitch: float | None = None
@@ -40,24 +41,33 @@ class DrowsinessMonitor:
     def update(self, now: float, face: FaceObservation) -> list[ConditionSignal]:
         th = self.th
         present = face.present and math.isfinite(face.ear)
-        absent = self._absent.update(now, not present)
+        # Absence is about the face detector, not a bad landmark pass.
+        absent = self._absent.update(now, not face.present)
 
-        # Learn neutral pitch from first frames.
-        if present and math.isfinite(face.pitch):
+        # Learn neutral pitch from usable frames.
+        reliable = present and self._plausible(face)
+        if reliable and math.isfinite(face.pitch):
             if len(self._pitch_samples) < 30:
                 self._pitch_samples.append(face.pitch)
             elif self._neutral_pitch is None:
                 self._neutral_pitch = sum(self._pitch_samples) / len(self._pitch_samples)
 
-        if not present:
+        if not reliable:
+            # A face the landmark model lost (hand over the mouth, profile
+            # turn) is not evidence of sleep. Skip the frame instead of
+            # feeding a bogus EAR into the microsleep and PERCLOS timers.
             self._microsleep.update(now, False)
             self._yawn.update(now, False)
             self._closed_prev = False
+            self._closed_run = 0
             self._blink_start = None
             self._perclos.prune(now)
-            return self._signals(now, absent, 0.0, False, False, False)
+            if not present:
+                return self._signals(now, absent, 0.0, False, False, False)
+            return self._signals(now, False, 0.0, False, False, False)
 
         closed = face.ear < th.ear_closed
+        self._closed_run = self._closed_run + 1 if closed else 0
         self._perclos.push(now, face.ear)
         self._track_blink(now, closed)
 
@@ -74,14 +84,35 @@ class DrowsinessMonitor:
                 self._nod_start = None
 
         microsleep = self._microsleep.update(now, closed)
+        # Report only after a run of closed samples; the Sustained timer still
+        # starts on the first closed frame, so the alert is not delayed twice.
+        microsleep = microsleep and self._closed_run >= max(
+            1, int(th.microsleep_min_frames)
+        )
         yawning = self._yawn.update(now, face.mar > th.yawn_mar)
         # Nodding counts as drowsiness (microsleep).
         if nodding:
             microsleep = self._microsleep.update(now, True) or microsleep
         perclos = self._perclos.fraction(lambda v: v < th.ear_closed)
-        covered = self._perclos.span() >= 0.6 * th.perclos_window_s
+        covered = (
+            self._perclos.span() >= 0.6 * th.perclos_window_s
+            and len(self._perclos) >= max(1, int(th.perclos_min_samples))
+        )
         perclos_active = covered and perclos >= th.perclos_alert and not microsleep
         return self._signals(now, absent, perclos, perclos_active, yawning, microsleep)
+
+    def _plausible(self, face: FaceObservation) -> bool:
+        """Reject landmark output that cannot be a normal open/closed face."""
+        th = self.th
+        if not (math.isfinite(face.ear) and math.isfinite(face.mar)):
+            return False
+        if face.ear > th.drowsy_valid_ear_max or face.mar > th.drowsy_valid_mar_max:
+            return False
+        if math.isfinite(face.yaw) and abs(face.yaw) > th.drowsy_max_yaw_deg:
+            return False
+        if math.isfinite(face.pitch) and abs(face.pitch) > th.drowsy_max_pitch_deg:
+            return False
+        return True
 
     def _track_blink(self, now: float, closed: bool) -> None:
         if closed and not self._closed_prev:
@@ -229,6 +260,11 @@ class SmokingMonitor:
         height = detection.box[3] - detection.box[1]
         if max(width, height) > self.th.cigarette_max_size_span * span:
             return False
+        if width <= 0 or height <= 0:
+            return False
+        aspect = max(width, height) / min(width, height)
+        if aspect < self.th.cigarette_min_aspect:
+            return False
         cx, cy = detection.center
         mouth = face.mouth_point
         if mouth is None:
@@ -242,7 +278,12 @@ class SmokingMonitor:
         # Keep this tight around the lips. A phone at the ear is ~0.45
         # face-heights out, and hands at the chin land around 0.5; the default
         # 0.30 still covers a cigarette at the lips or just below them.
-        return abs(cx - mx) <= gate * span and abs(cy - my) <= gate * span
+        if abs(cx - mx) > gate * span or abs(cy - my) > gate * span:
+            return False
+        bx1, by1, bx2, by2 = detection.box
+        dx = max(bx1 - mx, 0.0, mx - bx2)
+        dy = max(by1 - my, 0.0, my - by2)
+        return math.hypot(dx, dy) <= self.th.cigarette_mouth_pad_span * span
 
 
 class DrinkingMonitor:

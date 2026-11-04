@@ -67,6 +67,24 @@ class Thresholds:
     yawn_mar: float = 0.55
     yawn_s: float = 1.0
     face_missing_s: float = 2.0
+    # A hand over the face, a profile view or a landmark glitch produces
+    # impossible EAR/MAR values. Those frames are skipped instead of being
+    # counted as "eyes closed": on a 1 fps Pi frame rate one bad sample would
+    # otherwise be enough to trigger a false microsleep alarm.
+    drowsy_valid_ear_max: float = 0.50
+    drowsy_valid_mar_max: float = 1.20
+    # Generous absolute pose bounds: a desk-mounted Pi camera often sees the
+    # driver at 40-45 degrees of yaw even when they face the screen. The EAR
+    # range above is the primary guard against lost landmarks.
+    drowsy_max_yaw_deg: float = 60.0
+    drowsy_max_pitch_deg: float = 50.0
+    # Require a run of closed samples, so a single glitch cannot alarm even
+    # when the frame rate is very low. The timer starts on the first closed
+    # frame; these samples only gate the report.
+    microsleep_min_frames: int = 3
+    # PERCLOS is a ratio over the window; with only a handful of frames it is
+    # noise. Below this sample count the ratio is not reported at all.
+    perclos_min_samples: int = 10
 
     # --- smoking ---
     # A single false "Stop smoking" is unacceptable, so a box must first pass
@@ -88,6 +106,14 @@ class Thresholds:
     # the mouth. Tested real boxes reach 0.51; a phone held at the chin was
     # 0.61 and is rejected here.
     cigarette_max_size_span: float = 0.55
+    # Cigarettes are elongated; a watch, ring or round pen cap is not. The
+    # default 1.0 disables the check (PC profile); the Pi profile raises it.
+    cigarette_min_aspect: float = 1.0
+    # The mouth point must lie within this many face heights of the box
+    # (zero when the mouth is inside it). A cigarette at the lips overlaps
+    # the mouth; a watch on the cheek does not. The default is effectively
+    # unlimited so only profiles that opt in are tightened.
+    cigarette_mouth_pad_span: float = 1.0
     # Bridge one missed detector pass without re-announcing a finished puff.
     cigarette_hold_s: float = 1.0
 

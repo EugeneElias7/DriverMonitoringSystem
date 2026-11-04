@@ -6,19 +6,6 @@
   },
   "detectors": [
     {
-      "name": "driver",
-      "model_path": "models/best.onnx",
-      "classes_path": "models/driver_classes.txt",
-      "classes_whitelist": [
-        "drinking",
-        "eating",
-        "seatbelt"
-      ],
-      "conf_threshold": 0.2,
-      "target_hz": 1.0,
-      "enabled": true
-    },
-    {
       "name": "cigarette",
       "model_path": "models/cigarette_smokers_v4.onnx",
       "classes_path": "models/cigarette_v4_classes.txt",
@@ -51,13 +38,17 @@
     "perclos_window_s": 4.0,
     "yawn_mar": 0.55,
     "yawn_s": 1.0,
+    "microsleep_min_frames": 3,
+    "perclos_min_samples": 10,
     "cigarette_s": 2.5,
     "cigarette_high_conf": 0.6,
     "cigarette_low_conf": 0.45,
     "cigarette_low_s": 3.0,
     "cigarette_hold_s": 3.0,
-    "cigarette_gate_span": 0.3,
-    "cigarette_max_size_span": 0.55,
+    "cigarette_gate_span": 0.24,
+    "cigarette_max_size_span": 0.5,
+    "cigarette_min_aspect": 1.15,
+    "cigarette_mouth_pad_span": 0.12,
     "phone_low_conf": 0.15,
     "phone_hand_conf": 0.2,
     "phone_call_s": 1.5,
@@ -76,12 +67,12 @@
     "controls": {
       "AwbEnable": false,
       "ColourGains": [
-        1.2,
-        1.4
+        0.95,
+        1.0
       ]
     }
   },
-  "alert_cooldown_s": 2.5,
+  "alert_cooldown_s": 5.0,
   "capture_width": 640,
   "capture_height": 480,
   "display": true

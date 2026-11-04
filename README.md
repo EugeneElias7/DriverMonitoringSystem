@@ -19,10 +19,10 @@ Pi 3 lacks). Object detection is OpenCV DNN over ONNX YOLO models.
 | Objects | drinking, eating, no seatbelt          | status only           |
 | Head    | looking away from the road             | status only           |
 
-The spoken warnings repeat every `alert_cooldown_s` (2.5 s by default) while
-the condition stays active. Smoking and phone conditions are held through a
-missed detector pass, so a dropped frame does not silence a warning. The
-alert stops when the condition clears.
+The spoken warnings repeat every `alert_cooldown_s` (2.5 s on the PC, 5 s on
+the Pi) while the condition stays active. Smoking and phone conditions are
+held through a missed detector pass, so a dropped frame does not silence a
+warning. The alert stops when the condition clears.
 
 The preview shows:
 
@@ -96,7 +96,9 @@ The dedicated cigarette model is the only source of cigarette detections.
 `best.onnx` still lists a cigarette class but it is masked out: on webcam
 footage it produced false boxes, including occasional full-frame ones. The
 dedicated model runs on both PC and Pi; `config_pi.json` samples it at 0.5 Hz
-and lengthens the confirmation time accordingly.
+and lengthens the confirmation time accordingly. The Pi profile also drops the
+`best.onnx` detector entirely: drinking, eating and seatbelt are status-only,
+and a third 640-pixel pass costs another ~2.5 s on the Cortex-A53.
 
 ## Run on the PC
 
@@ -119,37 +121,53 @@ Press `q` or `Esc` to quit. Useful flags:
 
 ## Run on the Raspberry Pi 3
 
-Use 64-bit Raspberry Pi OS. The defaults in `deploy/upload.sh` are
-`sansolution@192.168.1.14:/home/sansolution/dms`; override with `PI_USER`,
-`PI_HOST`, and `PI_DIR` if your setup differs.
-
-From the PC:
-
-```powershell
-bash deploy/upload.sh
-```
-
-On the Pi:
+The deployed copy is `/home/sansolution/dms` on 64-bit Raspberry Pi OS
+(trixie, Python 3.13). The venv uses the system packages because `picamera2`
+and the distro OpenCV are installed by apt:
 
 ```bash
 ssh sansolution@192.168.1.14
 cd /home/sansolution/dms
-python3 -m venv --system-site-packages .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-python run.py --config config_pi.json --source picamera
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python run.py --config config_pi.json --source picamera
 ```
 
-Use `--source 0` for a USB webcam. The `picamera` source needs
-`sudo apt install python3-picamera2` and a venv created with
-`--system-site-packages`.
+Run it from the Pi desktop for the preview window. Over SSH add `--headless`;
+the app probes the display first and falls back to headless instead of hanging
+when XWayland is not reachable from the session.
 
-If `opencv-python` does not install on the Pi, use
-`opencv-python-headless`; the preview window is then unavailable, so run with
-`--headless` and read the status lines.
+`config_pi.json` enables only the cigarette and phone detectors. On this Pi 3
+a cigarette pass takes ~5-6 s and a phone pass ~6-7 s, with about one processed
+frame per second headless (roughly half that with the preview window) and
+~420 MB resident memory. Alerts still fire 1-3 s after the confirming detection
+because the last result is held between passes; boxes older than 1.5 s are
+marked `STALE`.
 
-Do **not** install MediaPipe on the Pi 3. The OpenCV face path is the supported
-path.
+The CSI night-vision module (OV5647 without an IR-cut filter) renders daylight
+magenta under auto white balance. `config_pi.json` disables AWB and fixes
+`ColourGains` at `[0.95, 1.0]`, the neutral point measured on this camera; the
+app applies it through `Picamera2.set_controls`. The same values can be tested
+without the app:
+
+```bash
+rpicam-still --nopreview --width 640 --height 480 --timeout 1200 \
+  --awbgains 0.95,1.00 -o /tmp/test.jpg
+```
+
+`vcgencmd get_throttled` must read `0x0`. This Pi currently reports `0x50005`
+(under-voltage and active throttling), so use a 5 V 2.5 A supply with a short
+cable; otherwise model latency, temperature and camera stability suffer.
+
+Use `--source 0` for a USB webcam. Do **not** install MediaPipe on the Pi 3:
+the OpenCV face path is the supported path.
+
+The defaults in `deploy/upload.sh` are
+`sansolution@192.168.1.14:/home/sansolution/dms`; override with `PI_USER`,
+`PI_HOST`, and `PI_DIR` if your setup differs. From the PC:
+
+```powershell
+bash deploy/upload.sh
+```
 
 ## Audio
 
@@ -176,22 +194,34 @@ Windows or `espeak`/`espeak-ng` on Linux.
 - `detectors[]`: `name`, `model_path`, `classes_path`, `conf_threshold`,
   `class_conf_overrides`, `target_hz`, `enabled`
 - `thresholds.cigarette_s`, `cigarette_high_conf`, `cigarette_low_conf`,
-  `cigarette_low_s`, `cigarette_gate_span`, `cigarette_max_size_span`
+  `cigarette_low_s`, `cigarette_gate_span`, `cigarette_max_size_span`,
+  `cigarette_min_aspect`, `cigarette_mouth_pad_span`
 - `thresholds.phone_call_s`, `phone_in_hand_s`, `phone_hold_s`
-- `thresholds.ear_closed`, `microsleep_s`, `yawn_mar`, `yawn_s`
+- `thresholds.ear_closed`, `microsleep_s`, `microsleep_min_frames`,
+  `perclos_min_samples`, `yawn_mar`, `yawn_s`
 - `alert_cooldown_s`: repeat cadence while a condition stays active
 - `audio.device`: ALSA device on Linux
 - `display`: `false` for headless
 
-Smoking is deliberately conservative. A cigarette box must sit within 0.30
-face-heights of the mouth, be no larger than 0.55 face-heights, and stay
-detected for 1.0 s at confidence 0.60+ (or 1.5 s at 0.45+). The dedicated
-model runs at 2 Hz on the PC, so this spans at least two detector passes. On
-the Pi the same bar is 2.5 s / 3.0 s because the model runs at 0.5 Hz. A real
-puff stays at the lips long enough to alert; a single flickering box cannot.
+Smoking is deliberately conservative. On the PC a cigarette box must sit
+within 0.30 face-heights of the mouth, be no larger than 0.55 face-heights,
+and stay detected for 1.0 s at confidence 0.60+ (or 1.5 s at 0.45+). The
+dedicated model runs at 2 Hz there, so this spans at least two detector
+passes. The Pi profile tightens the geometry to 0.24 / 0.50 face-heights,
+requires an elongated box (aspect ≥ 1.15) whose mouth pad is ≤ 0.12
+face-heights, and waits 2.5 s / 3.0 s because the model runs at 0.5 Hz. A real
+puff stays at the lips long enough to alert; a watch, ring or pen on the
+cheek does not pass the geometry.
 
 A disabled detector does not need its model or class file to exist, so a
 profile can drop a model without deleting files.
+
+Drowsiness ignores frames with an impossible EAR (> 0.50), an implausible MAR
+(> 1.20) or an extreme head pose, which is what a hand over the face produces.
+It also needs `microsleep_min_frames` consecutive closed samples (3), and
+PERCLOS needs `perclos_min_samples` samples in the window (10). On a 1 fps Pi
+the PERCLOS ratio is therefore not reported at all instead of firing on three
+noisy samples; microsleep still works from a genuine run of closed eyes.
 
 ## Tests
 
@@ -201,14 +231,18 @@ From the project root:
 python -m unittest discover -s tests -v
 ```
 
-The smoke test loads both configs, checks that the model files exist, runs the
-face and object models once on a blank frame, and verifies the alert hold.
+The tests load both configs, check that the model files exist, run the face
+and object models once on a blank frame, and cover the alert hold, the
+drowsiness validity/run guards, and the cigarette geometry gates.
 
 ## Notes and limits
 
 - Object detectors run on background threads, so a slow Pi does not freeze the
   face loop. Each detector has its own `target_hz`.
-- Pi 3 frame rate, latency, and thermal behaviour are not measured here.
+- Measured on this Pi 3: ~1 processed frame/s, 5-7 s per 640-pixel YOLO pass,
+  ~420 MB resident memory, 55-60 °C. The CPU is the limit, not RAM or disk.
+- The preview window is optional. If highgui cannot open a display, the app
+  prints a note and continues headless instead of blocking.
 - The models are trained for a driver-facing camera. A laptop webcam is a
   different view; treat the PC test as a functional check, not an accuracy
   result.
