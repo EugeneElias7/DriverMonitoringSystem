@@ -550,8 +550,8 @@ class DistractionMonitor:
         if max(width, height) > self.th.phone_max_size_span * span:
             return False
         return (
-            x1 - 0.55 * span <= cx <= x2 + 0.55 * span
-            and y1 - 0.25 * span <= cy <= y2 + 1.5 * span
+            x1 - 0.40 * span <= cx <= x2 + 0.40 * span
+            and y1 - 0.25 * span <= cy <= y2 + 1.0 * span
         )
 
     def _at_ear(self, detection: Detection, face: FaceObservation) -> bool:

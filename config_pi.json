@@ -13,9 +13,9 @@
         "cell phone"
       ],
       "class_conf_overrides": {
-        "cell phone": 0.1
+        "cell phone": 0.2
       },
-      "conf_threshold": 0.1,
+      "conf_threshold": 0.2,
       "target_hz": 1.0,
       "enabled": true
     },
@@ -33,7 +33,7 @@
   ],
   "thresholds": {
     "ear_closed": 0.12,
-    "drowsy_max_yaw_deg": 70.0,
+    "drowsy_max_yaw_deg": 85.0,
     "drowsy_max_pitch_deg": 55.0,
     "microsleep_s": 0.5,
     "perclos_alert": 0.35,
@@ -51,11 +51,12 @@
     "cigarette_max_size_span": 0.5,
     "cigarette_min_aspect": 1.15,
     "cigarette_mouth_pad_span": 0.12,
-    "phone_low_conf": 0.1,
-    "phone_hand_conf": 0.15,
+    "phone_low_conf": 0.2,
+    "phone_hand_conf": 0.25,
     "phone_call_s": 0.8,
     "phone_in_hand_s": 0.8,
     "phone_hold_s": 3.0,
+    "phone_max_size_span": 1.0,
     "seatbelt_check": false,
     "yaw_away_deg": 999.0,
     "pitch_away_deg": 999.0,

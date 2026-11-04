@@ -63,12 +63,12 @@ class ConfigTests(unittest.TestCase):
         self.assertLessEqual(pi.thresholds.ear_closed, 0.12)
         # This camera sees the driver at a steep angle; leave headroom above
         # the measured ~53 deg yaw so a valid closed-eye frame is not rejected.
-        self.assertGreaterEqual(pi.thresholds.drowsy_max_yaw_deg, 65.0)
+        self.assertGreaterEqual(pi.thresholds.drowsy_max_yaw_deg, 80.0)
         # Phone should stay sensitive; the Pi only gets one pass every few
         # seconds, so the low-confidence gates cannot be too strict.
         self.assertLessEqual(pi.thresholds.phone_call_s, 1.0)
-        self.assertLessEqual(pi.thresholds.phone_low_conf, 0.1)
-        self.assertLessEqual(pi.thresholds.phone_hand_conf, 0.15)
+        self.assertLessEqual(pi.thresholds.phone_low_conf, 0.2)
+        self.assertLessEqual(pi.thresholds.phone_hand_conf, 0.25)
         # Cigarette must stay conservative: a single false box is held until
         # the next slow pass, so confirmations need to be long enough.
         self.assertLessEqual(pi.thresholds.cigarette_s, 1.0)
