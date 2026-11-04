@@ -208,6 +208,14 @@ def _status_line(
         ref,
         f"det={found}",
     ]
+    if face.ear < 0.25 and (
+        math.isfinite(face.ear_left) or math.isfinite(face.ear_right)
+    ):
+        # Near/at closure, show both eyes separately: the averaged EAR can
+        # hide one eyelid whose landmarks are lagging at a steep camera angle.
+        left = f"{face.ear_left:.3f}" if math.isfinite(face.ear_left) else "nan"
+        right = f"{face.ear_right:.3f}" if math.isfinite(face.ear_right) else "nan"
+        parts.insert(4, f"eyeL={left} eyeR={right}")
     if math.isfinite(blink_rate):
         parts.insert(4, f"blinks={blink_rate:3.0f}/min")
     if perception is not None and perception.workers:

@@ -152,25 +152,25 @@ profile also:
 
 - serializes detector passes through a priority gate, so two YOLO forwards
   never fight over the four Cortex-A53 cores;
-- caps OpenCV at `opencv_threads: 3`: the face path is as fast as at 2
-  threads, while a YOLO pass is ~20% faster than at 2 threads and still much
-  faster than the face path is at 4;
+- caps OpenCV at `opencv_threads: 2`: on this Pi 3 that is faster and more
+  consistent than 3 threads (less memory-bandwidth contention) and draws a
+  smaller current spike, so the 5 V rail is less likely to collapse;
 - captures at `target_fps: 5`, enough for the face loop without running the
   camera pipeline flat out;
 - uses face-first scheduling (`face_first: true`): the moment the eyes close
   or the face disappears, detector workers stop starting new passes until the
   face is back. A pass already in flight finishes, but it cannot delay the
   confirming face frame by another whole pass;
-- skips the model self-test and the startup phrase on the Pi
-  (`self_test: false`, `audio.announce_startup: false`), so a sleep test
-  started immediately is not delayed by ~7 s of startup work.
+- skips the model self-test on the Pi (`self_test: false`) but keeps the
+  short startup phrase (`audio.announce_startup: true`) so the speaker path is
+  proven before an alert is needed.
 
-Measured headless on this Pi 3: ~1.3 processed frames/s, ~2.1-2.4 s for one
-cigarette pass at the full 1.2 GHz clock with 3 threads, 3.9-5.0 s while the
-board is actively throttled to 600 MHz, and ~410 MB resident memory. At
-600 MHz the 3-thread setting cuts a cigarette pass to ~2.4 s versus
-~2.8-3.1 s at 2 threads. Detector results are held between passes, so the
-overlay marks boxes older than 1.5 s as `STALE`.
+Measured headless on this Pi 3: ~1.5 processed frames/s, ~1.8 s for one
+cigarette pass at the full 1.2 GHz clock with 2 threads, roughly double that
+while the board is actively throttled to 600 MHz, and ~410 MB resident
+memory. Three threads measured 2.1-2.4 s per pass and caused a larger current
+spike, so the Pi profile uses two. Detector results are held between passes,
+so the overlay marks boxes older than 1.5 s as `STALE`.
 
 The CSI night-vision module (OV5647 without an IR-cut filter) renders daylight
 magenta under auto white balance. `config_pi.json` disables AWB and fixes
@@ -269,7 +269,7 @@ Windows or `espeak`/`espeak-ng` on Linux.
   `perclos_min_samples`, `yawn_mar`, `yawn_s`
 - `alert_cooldown_s`: repeat cadence while a condition stays active
 - `audio.device`: ALSA device on Linux
-- `audio.announce_startup`: play the startup phrase (`false` on the Pi)
+- `audio.announce_startup`: play the startup phrase (enabled on the Pi)
 - `self_test`: run the models once at startup and print timings (`false` on
   the Pi, where it costs ~5 s before the first frame)
 - `display`: `false` for headless
@@ -290,10 +290,13 @@ profile can drop a model without deleting files.
 
 Drowsiness ignores frames with an impossible EAR (> 0.50), an implausible MAR
 (> 1.20) or an extreme head pose, which is what a hand over the face produces.
-The Pi profile needs 2 consecutive closed samples, both eyelids below 0.12,
-and 0.5 s, so a real closure alerts in under a second once the 5 V supply
-holds the full clock; a normal 0.2-0.4 s blink cannot cover two samples that
-far apart, and a one-eye landmark glitch cannot start the run. Face-first
+The Pi profile needs 2 consecutive closed samples with the averaged EAR below
+0.12 for 0.5 s, so a real closure alerts in under a second once the 5 V supply
+holds the full clock. The average is already robust against one bad eyelid:
+it can only fall below 0.12 when both eyes are at least partly shut. The
+per-eye values are printed in the status line while the eyes are near
+closure, because a steep camera angle can make the far eye read high even
+when its lid is shut. Face-first
 scheduling pauses detector passes as soon as a closed run starts, which is
 what keeps those samples coming quickly.
 PERCLOS still needs `perclos_min_samples` samples (10) in its window, so on a
@@ -310,7 +313,7 @@ python -m unittest discover -s tests -v
 
 The tests load both configs, check that the model files exist, run the face
 and object models once on a blank frame, and cover the alert hold, the
-drowsiness validity/run guards, the both-eyes Pi frame bar, the cigarette
+drowsiness validity/run guards, the steep-yaw close-eye case, the cigarette
 geometry gates, detector serialization/pause, and the alert/audio priority
 order.
 
@@ -324,11 +327,11 @@ order.
 - The face path is the priority. Alert audio is held in a priority queue with
   drowsiness first, phone second, smoking third. A phrase already playing is
   not interrupted, so the worst extra delay is one ~1.9 s phrase.
-- Measured on this Pi 3: ~1.3 processed frames/s headless, ~2.1 s per
-  640-pixel cigarette pass at 1.2 GHz (3.9-5.0 s while actively throttled),
-  ~410 MB resident memory, 50-64 °C. At the throttled 600 MHz the 3-thread
-  cap gives ~2.4 s per pass versus ~2.8-3.1 s at 2 threads. The CPU and the
-  5 V supply are the limits, not RAM or disk.
+- Measured on this Pi 3: ~1.5 processed frames/s headless, ~1.8 s per
+  640-pixel cigarette pass at 1.2 GHz with 2 threads (roughly double while
+  actively throttled), ~410 MB resident memory, 50-64 °C. Three threads were
+  slower and drew a larger current spike. The CPU and the 5 V supply are the
+  limits, not RAM or disk.
 - Object latency is set by the two 640-pixel passes sharing one gate: each
   detector gets a pass about every 4-5 s at the full clock, so a phone or
   cigarette alert typically appears in 4-6 s (about double while throttled).

@@ -66,21 +66,14 @@ class DrowsinessMonitor:
                 return self._signals(now, absent, 0.0, False, False, False)
             return self._signals(now, False, 0.0, False, False, False)
 
-        # Both eyelids must be shut. A single-eye landmark glitch can drag the
-        # averaged EAR down while the driver is awake, so the average alone is
-        # not enough. Scripted sources leave the per-eye values NaN; in that
-        # case fall back to the average.
-        closed = (
-            face.ear < th.ear_closed
-            and (
-                not math.isfinite(face.ear_left)
-                or face.ear_left < th.ear_closed
-            )
-            and (
-                not math.isfinite(face.ear_right)
-                or face.ear_right < th.ear_closed
-            )
-        )
+        # Use the averaged EAR, which is already robust against a single bad
+        # eyelid: to get the average below the closed bar, both eyes must be
+        # at least partly shut. Requiring both per-eye values below the same
+        # bar breaks at a steep camera angle (this Pi sees the driver at
+        # ~50 deg yaw), where the far eye's landmarks read high even when the
+        # eyelid is shut. The per-eye values remain in the status line for
+        # diagnosis.
+        closed = face.ear < th.ear_closed
         self._closed_run = self._closed_run + 1 if closed else 0
         self._perclos.push(now, face.ear)
         self._track_blink(now, closed)
