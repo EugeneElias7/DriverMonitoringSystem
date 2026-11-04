@@ -67,8 +67,12 @@ class PicameraCapture:
 
     def read(self):
         try:
-            frame = self._cam.capture_array("main")
-        except RuntimeError:
+            # A camera/CSI fault can leave capture_array blocked forever, which
+            # also defeats --max-seconds and keeps the camera locked after the
+            # run. Bounded wait turns that into a normal "camera stopped"
+            # exit so the process releases the device.
+            frame = self._cam.capture_array("main", wait=2.0)
+        except (RuntimeError, TimeoutError):
             return False, None
         return True, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
@@ -464,7 +468,8 @@ def run(
         audio = AudioAlerter(cfg.audio.wav_dir, device=cfg.audio.device)
         if audio.available:
             sinks.append(audio)
-            audio.announce_startup()
+            if cfg.audio.announce_startup:
+                audio.announce_startup()
         else:
             print("note: voice alerts unavailable on this machine", flush=True)
 
@@ -486,8 +491,9 @@ def run(
 
     try:
         perception = Perception(cfg)
-        for line in perception.self_test():
-            print(f"self-test: {line}", flush=True)
+        if cfg.self_test:
+            for line in perception.self_test():
+                print(f"self-test: {line}", flush=True)
         perception.start()
         cap = _open_capture(source, cfg)
         labels = perception.labels

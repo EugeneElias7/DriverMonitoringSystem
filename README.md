@@ -98,11 +98,14 @@ The runtime expects the Ultralytics detection layout
 The dedicated cigarette model is the only source of cigarette detections.
 `best.onnx` still lists a cigarette class but it is masked out: on webcam
 footage it produced false boxes, including occasional full-frame ones. The
-dedicated model runs on both PC and Pi. `config_pi.json` gives it a 2 Hz
-start-to-start target; the pass itself is CPU-bound, so the effective cadence
-is about one pass plus a short rest. The Pi profile also drops the `best.onnx`
-detector entirely: drinking, eating and seatbelt are status-only, and a third
-640-pixel pass costs another ~2.5 s on the Cortex-A53.
+dedicated model runs on both PC and Pi. `config_pi.json` lists phone first and
+cigarette second, because the detector list is also the gate priority order
+(sleep > phone > cigarette). Both use a 1 Hz start-to-start target so each
+worker rests between passes instead of one model monopolizing the gate; the
+pass itself is CPU-bound, so the effective cadence is roughly one pass each.
+The Pi profile also drops the `best.onnx` detector entirely: drinking, eating
+and seatbelt are status-only, and a third 640-pixel pass costs another ~2.5 s
+on the Cortex-A53.
 
 ## Run on the PC
 
@@ -129,35 +132,45 @@ The deployed copy is `/home/sansolution/dms` on 64-bit Raspberry Pi OS
 (trixie, Python 3.13). The venv uses the system packages because `picamera2`
 and the distro OpenCV are installed by apt:
 
+Double-click the **DMS** desktop icon, or run one command:
+
 ```bash
-ssh sansolution@192.168.1.14
 cd /home/sansolution/dms
-.venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python run.py --config config_pi.json --source picamera
+./start.sh
 ```
 
-Run it from the Pi desktop for the preview window. Over SSH add `--headless`;
-the app probes the display first and falls back to headless instead of hanging
-when XWayland is not reachable from the session.
+Over SSH the same command runs headless automatically. The app probes the
+display first and falls back to headless instead of hanging when XWayland is
+not reachable from the session. Pass normal app flags after the script, e.g.
+`./start.sh --max-seconds 60`.
+
+The test suite lives in the source tree on the PC; the Pi deployment keeps
+only the runtime files.
 
 `config_pi.json` enables only the cigarette and phone detectors. The Pi
 profile also:
 
 - serializes detector passes through a priority gate, so two YOLO forwards
   never fight over the four Cortex-A53 cores;
-- caps OpenCV at `opencv_threads: 2`, which leaves cores for the face path;
+- caps OpenCV at `opencv_threads: 3`: the face path is as fast as at 2
+  threads, while a YOLO pass is ~20% faster than at 2 threads and still much
+  faster than the face path is at 4;
 - captures at `target_fps: 5`, enough for the face loop without running the
   camera pipeline flat out;
 - uses face-first scheduling (`face_first: true`): the moment the eyes close
   or the face disappears, detector workers stop starting new passes until the
   face is back. A pass already in flight finishes, but it cannot delay the
-  confirming face frame by another whole pass.
+  confirming face frame by another whole pass;
+- skips the model self-test and the startup phrase on the Pi
+  (`self_test: false`, `audio.announce_startup: false`), so a sleep test
+  started immediately is not delayed by ~7 s of startup work.
 
-Measured headless on this Pi 3: ~1.3 processed frames/s, ~2.1 s for one
-cigarette pass at the full 1.2 GHz clock, 3.9-5.0 s while the board is
-actively throttled to 600 MHz, and ~410 MB resident memory. Detector results
-are held between passes, so the overlay marks boxes older than 1.5 s as
-`STALE`.
+Measured headless on this Pi 3: ~1.3 processed frames/s, ~2.1-2.4 s for one
+cigarette pass at the full 1.2 GHz clock with 3 threads, 3.9-5.0 s while the
+board is actively throttled to 600 MHz, and ~410 MB resident memory. At
+600 MHz the 3-thread setting cuts a cigarette pass to ~2.4 s versus
+~2.8-3.1 s at 2 threads. Detector results are held between passes, so the
+overlay marks boxes older than 1.5 s as `STALE`.
 
 The CSI night-vision module (OV5647 without an IR-cut filter) renders daylight
 magenta under auto white balance. `config_pi.json` disables AWB and fixes
@@ -256,6 +269,9 @@ Windows or `espeak`/`espeak-ng` on Linux.
   `perclos_min_samples`, `yawn_mar`, `yawn_s`
 - `alert_cooldown_s`: repeat cadence while a condition stays active
 - `audio.device`: ALSA device on Linux
+- `audio.announce_startup`: play the startup phrase (`false` on the Pi)
+- `self_test`: run the models once at startup and print timings (`false` on
+  the Pi, where it costs ~5 s before the first frame)
 - `display`: `false` for headless
 
 Smoking is deliberately conservative. On the PC a cigarette box must sit
@@ -264,20 +280,22 @@ and stay detected for 1.0 s at confidence 0.60+ (or 1.5 s at 0.45+). The
 dedicated model runs at 2 Hz there, so this spans at least two detector
 passes. The Pi profile tightens the geometry to 0.24 / 0.50 face-heights,
 requires an elongated box (aspect ≥ 1.15) whose mouth pad is ≤ 0.12
-face-heights, and uses the same 1.0 s / 1.5 s confirmation with a 4 s hold.
-A real puff stays at the lips long enough to alert; a watch, ring or pen on
-the cheek does not pass the geometry.
+face-heights, and confirms in 1.0 s at 0.60+ (or 1.5 s at 0.50+) with a 4 s
+hold. A real puff stays at the lips long enough to alert; a watch, ring or
+pen on the cheek does not pass the geometry. Phone calls and phones held in
+hand confirm in 0.8 s on the Pi.
 
 A disabled detector does not need its model or class file to exist, so a
 profile can drop a model without deleting files.
 
 Drowsiness ignores frames with an impossible EAR (> 0.50), an implausible MAR
 (> 1.20) or an extreme head pose, which is what a hand over the face produces.
-The Pi profile needs 3 consecutive closed samples, both eyelids below 0.10,
-and 1.2 s, so a real closure alerts in roughly 1.5-2 s at 1-2 fps; a normal
-0.2-0.4 s blink does not reach the bar, and a one-eye landmark glitch cannot
-start the run. Face-first scheduling pauses detector passes as soon as a
-closed run starts, which is what keeps those samples coming quickly.
+The Pi profile needs 2 consecutive closed samples, both eyelids below 0.12,
+and 0.5 s, so a real closure alerts in under a second once the 5 V supply
+holds the full clock; a normal 0.2-0.4 s blink cannot cover two samples that
+far apart, and a one-eye landmark glitch cannot start the run. Face-first
+scheduling pauses detector passes as soon as a closed run starts, which is
+what keeps those samples coming quickly.
 PERCLOS still needs `perclos_min_samples` samples (10) in its window, so on a
 1-2 fps Pi it stays quiet instead of firing on a handful of noisy samples;
 microsleep remains the fast path.
@@ -292,7 +310,7 @@ python -m unittest discover -s tests -v
 
 The tests load both configs, check that the model files exist, run the face
 and object models once on a blank frame, and cover the alert hold, the
-drowsiness validity/run guards, the both-eyes 3-frame bar, the cigarette
+drowsiness validity/run guards, the both-eyes Pi frame bar, the cigarette
 geometry gates, detector serialization/pause, and the alert/audio priority
 order.
 
@@ -300,15 +318,23 @@ order.
 
 - Object detectors run on background threads, so a slow Pi does not freeze the
   face loop. Each detector has its own `target_hz`; on the Pi one shared gate
-  serializes passes, and face-first scheduling pauses new passes while the
-  eyes are closed or no face is visible.
+  serializes passes in list order (phone, then cigarette), and face-first
+  scheduling pauses new passes while the eyes are closed or no face is
+  visible.
 - The face path is the priority. Alert audio is held in a priority queue with
   drowsiness first, phone second, smoking third. A phrase already playing is
   not interrupted, so the worst extra delay is one ~1.9 s phrase.
 - Measured on this Pi 3: ~1.3 processed frames/s headless, ~2.1 s per
   640-pixel cigarette pass at 1.2 GHz (3.9-5.0 s while actively throttled),
-  ~410 MB resident memory, 50-64 °C. The CPU and the 5 V supply are the
-  limits, not RAM or disk.
+  ~410 MB resident memory, 50-64 °C. At the throttled 600 MHz the 3-thread
+  cap gives ~2.4 s per pass versus ~2.8-3.1 s at 2 threads. The CPU and the
+  5 V supply are the limits, not RAM or disk.
+- Object latency is set by the two 640-pixel passes sharing one gate: each
+  detector gets a pass about every 4-5 s at the full clock, so a phone or
+  cigarette alert typically appears in 4-6 s (about double while throttled).
+  Sub-second object alerts need a Pi 4/5, a smaller re-exported model, or an
+  accelerator; the sleep path is the only one designed to confirm in under a
+  second on this board.
 - The preview window is optional. If highgui cannot open a display, the app
   prints a note and continues headless instead of blocking.
 - The models are trained for a driver-facing camera. A laptop webcam is a

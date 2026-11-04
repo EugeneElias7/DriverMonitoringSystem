@@ -40,14 +40,35 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(pc.serialize_detectors)
         self.assertTrue(pi.face_first)
         self.assertFalse(pc.face_first)
-        self.assertEqual(pi.opencv_threads, 2)
-        # Detector order is the priority order; cigarette must be first.
-        self.assertEqual(pi.detectors[0].name, "cigarette")
-        # Sleep must confirm in about 1.5-2 s, not after 4-5 s, while still
-        # requiring a run of three fully closed frames.
-        self.assertLessEqual(pi.thresholds.microsleep_min_frames, 3)
-        self.assertLessEqual(pi.thresholds.microsleep_s, 1.2)
-        self.assertLess(pi.thresholds.ear_closed, 0.15)
+        self.assertEqual(pi.opencv_threads, 3)
+        # The Pi skips the ~5 s model self-test and the 2 s startup phrase, so
+        # a sleep test started immediately is not delayed by either.
+        self.assertFalse(pi.self_test)
+        self.assertTrue(pc.self_test)
+        self.assertFalse(pi.audio.announce_startup)
+        self.assertTrue(pc.audio.announce_startup)
+        # Detector order is the priority order: phone before cigarette, after
+        # sleep. Both get a rest between passes instead of one always-ready
+        # worker monopolizing the shared gate.
+        self.assertEqual(pi.detectors[0].name, "phone")
+        self.assertEqual(pi.detectors[1].name, "cigarette")
+        self.assertGreaterEqual(pi.detectors[0].target_hz, 0.5)
+        self.assertGreaterEqual(pi.detectors[1].target_hz, 0.5)
+        # Sleep must confirm in under a second: two fully closed frames and a
+        # 0.5 s timer. A normal blink is shorter than that.
+        self.assertLessEqual(pi.thresholds.microsleep_min_frames, 2)
+        self.assertLessEqual(pi.thresholds.microsleep_s, 0.6)
+        self.assertLessEqual(pi.thresholds.ear_closed, 0.12)
+        # Phone should stay sensitive; the Pi only gets one pass every few
+        # seconds, so the low-confidence gates cannot be too strict.
+        self.assertLessEqual(pi.thresholds.phone_call_s, 1.0)
+        self.assertLessEqual(pi.thresholds.phone_low_conf, 0.1)
+        self.assertLessEqual(pi.thresholds.phone_hand_conf, 0.15)
+        # Cigarette must stay conservative: a single false box is held until
+        # the next slow pass, so confirmations need to be long enough.
+        self.assertLessEqual(pi.thresholds.cigarette_s, 1.0)
+        self.assertGreaterEqual(pi.thresholds.cigarette_low_s, 1.5)
+        self.assertGreaterEqual(pi.detectors[1].conf_threshold, 0.5)
 
 
 class TemporalTests(unittest.TestCase):
