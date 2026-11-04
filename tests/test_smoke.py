@@ -40,14 +40,40 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(pc.serialize_detectors)
         self.assertTrue(pi.face_first)
         self.assertFalse(pc.face_first)
+        # Two threads beat three on this Pi 3: less memory-bandwidth contention
+        # and a lower current spike, so the rail is less likely to throttle.
         self.assertEqual(pi.opencv_threads, 2)
-        # Detector order is the priority order; cigarette must be first.
-        self.assertEqual(pi.detectors[0].name, "cigarette")
-        # Sleep must confirm in about 1.5-2 s, not after 4-5 s, while still
-        # requiring a run of three fully closed frames.
-        self.assertLessEqual(pi.thresholds.microsleep_min_frames, 3)
-        self.assertLessEqual(pi.thresholds.microsleep_s, 1.2)
-        self.assertLess(pi.thresholds.ear_closed, 0.15)
+        # The Pi skips the ~5 s model self-test, but keeps the short startup
+        # phrase so the speaker path is proven before an alert is needed.
+        self.assertFalse(pi.self_test)
+        self.assertTrue(pc.self_test)
+        self.assertTrue(pi.audio.announce_startup)
+        self.assertTrue(pc.audio.announce_startup)
+        # Detector order is the priority order: phone before cigarette, after
+        # sleep. Both get a rest between passes instead of one always-ready
+        # worker monopolizing the shared gate.
+        self.assertEqual(pi.detectors[0].name, "phone")
+        self.assertEqual(pi.detectors[1].name, "cigarette")
+        self.assertGreaterEqual(pi.detectors[0].target_hz, 0.5)
+        self.assertGreaterEqual(pi.detectors[1].target_hz, 0.5)
+        # Sleep must confirm in under a second: two fully closed frames and a
+        # 0.5 s timer. A normal blink is shorter than that.
+        self.assertLessEqual(pi.thresholds.microsleep_min_frames, 2)
+        self.assertLessEqual(pi.thresholds.microsleep_s, 0.6)
+        self.assertLessEqual(pi.thresholds.ear_closed, 0.12)
+        # This camera sees the driver at a steep angle; leave headroom above
+        # the measured ~53 deg yaw so a valid closed-eye frame is not rejected.
+        self.assertGreaterEqual(pi.thresholds.drowsy_max_yaw_deg, 80.0)
+        # Phone should stay sensitive; the Pi only gets one pass every few
+        # seconds, so the low-confidence gates cannot be too strict.
+        self.assertLessEqual(pi.thresholds.phone_call_s, 1.0)
+        self.assertLessEqual(pi.thresholds.phone_low_conf, 0.2)
+        self.assertLessEqual(pi.thresholds.phone_hand_conf, 0.25)
+        # Cigarette must stay conservative: a single false box is held until
+        # the next slow pass, so confirmations need to be long enough.
+        self.assertLessEqual(pi.thresholds.cigarette_s, 1.0)
+        self.assertGreaterEqual(pi.thresholds.cigarette_low_s, 1.5)
+        self.assertGreaterEqual(pi.detectors[1].conf_threshold, 0.5)
 
 
 class TemporalTests(unittest.TestCase):
@@ -147,6 +173,21 @@ class DrowsinessTests(unittest.TestCase):
                 t, self._face(ear=0.19, ear_left=0.08, ear_right=0.30)
             )
             self.assertFalse(self._active(signals, "drowsy_microsleep"))
+
+    def test_far_eye_reading_high_does_not_block_real_closure(self) -> None:
+        # At a steep camera yaw the far eyelid can read ~0.17 while the
+        # visible eye is fully shut. The averaged EAR is clearly closed, so
+        # sleep must still alert; the old both-eyes-below-bar guard missed it.
+        monitor = DrowsinessMonitor(
+            Thresholds(
+                ear_closed=0.12, microsleep_s=0.1, microsleep_min_frames=2
+            )
+        )
+        for t in (0.0, 1.0, 2.0):
+            signals = monitor.update(
+                t, self._face(ear=0.11, ear_left=0.05, ear_right=0.17)
+            )
+        self.assertTrue(self._active(signals, "drowsy_microsleep"))
 
     def test_short_blink_does_not_reach_the_faster_bar(self) -> None:
         monitor = DrowsinessMonitor(

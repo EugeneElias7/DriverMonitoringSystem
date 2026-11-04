@@ -47,6 +47,9 @@ class AudioConfig:
     # phrases with an OS text-to-speech fallback, no extra dependencies.
     # Repeats while a condition stays active are paced by alert_cooldown_s.
     enabled: bool = True
+    # Play the confirmation phrase at startup. Disable on the Pi so the first
+    # real alert cannot queue behind a 2 s "Driver monitoring active" clip.
+    announce_startup: bool = True
     wav_dir: str = "audio"
     # Optional ALSA device for aplay on Linux, e.g. "plughw:Headphones".
     # Empty keeps ALSA's "default" PCM, which some Pi OS setups cannot open.
@@ -197,6 +200,10 @@ class AppConfig:
     alert_cooldown_s: float = 2.5
     log_path: str | None = None
     display: bool = True
+    # Run the face/object models once at startup and print their timings.
+    # Useful on the PC; on the Pi it costs ~5 s before the first frame, which
+    # is exactly when a quick sleep test is most likely to be attempted.
+    self_test: bool = True
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":
