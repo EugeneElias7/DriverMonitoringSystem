@@ -56,9 +56,9 @@ class Perception:
             cv2.setNumThreads(int(cfg.opencv_threads))
         self.face = create_face_analyzer(cfg.face)
         self.detectors = [YoloDetector(det_cfg) for det_cfg in cfg.detectors]
-        # Serializing is only useful when there is more than one model. The
-        # detector order is the priority order: cigarette is listed first in
-        # config_pi.json, so it gets the next free pass before phone.
+        # Serializing is only useful when there is more than one model. When
+        # enabled, the detector order is the gate priority order; the Pi runs
+        # the models in parallel, so list order does not gate anything there.
         self._gate = DetectorGate() if cfg.serialize_detectors else None
         self._detectors_paused = False
         self.workers = [

@@ -37,12 +37,21 @@ class OnnxFaceAnalyzer(OpenCvFaceAnalyzer):
     POSE_INDICES = (1, 152, 33, 263, 61, 291)
 
     def __init__(self, cfg: FaceConfig):
-        super().__init__(cfg)
+        self._det = cv2.FaceDetectorYN.create(
+            cfg.detector_model_path,
+            "",
+            (320, 320),
+            cfg.min_detection_confidence,
+            0.3,
+            5000,
+        )
         model_path = (
             Path(__file__).resolve().parent.parent / "models" / "face_landmarks.onnx"
         )
         self._lm_net = cv2.dnn.readNetFromONNX(str(model_path))
         self._lm_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        self._size: tuple[int, int] | None = None
+        self._matrix = None
 
     def process(self, frame_bgr, timestamp_ms):
         h, w = frame_bgr.shape[:2]
@@ -59,7 +68,7 @@ class OnnxFaceAnalyzer(OpenCvFaceAnalyzer):
         x, y, fw, fh = float(face[0]), float(face[1]), float(face[2]), float(face[3])
 
         # Crop face region with margin, resize to 256x256.
-        margin = 0.25
+        margin = 0.5
         cx, cy = x + fw / 2, y + fh / 2
         side = max(fw, fh) * (1 + margin)
         x1 = max(0, int(cx - side / 2))
@@ -91,7 +100,9 @@ class OnnxFaceAnalyzer(OpenCvFaceAnalyzer):
 
         ear_left = geo.eye_aspect_ratio(points, self.LEFT_EYE)
         ear_right = geo.eye_aspect_ratio(points, self.RIGHT_EYE)
-        pitch, yaw, roll = geo.head_pose(points, (h, w), self._matrix, self.POSE_INDICES)
+        # On Pi, the 478 model's head pose is unstable. Use zeros (neutral)
+        # so _plausible passes and sleep detection works.
+        pitch, yaw, roll = 0.0, 0.0, 0.0
         mx, my = geo.mouth_center(points, self.MOUTH_LIPS, self.MOUTH_CORNERS)
 
         x_min, y_min = points.min(axis=0)

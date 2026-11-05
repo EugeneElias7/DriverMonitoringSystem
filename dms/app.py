@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -30,6 +31,10 @@ _SEVERITY_COLOURS = {
 # on the Pi a pass takes 12-16 s, and a green box drawn on a live frame reads
 # as "the model sees the phone over there right now" when it does not.
 _STALE_DETECTION_S = 1.5
+# Temporary tuning aid: DMS_DEBUG_GATES=1 appends raw detector boxes and the
+# face/mouth geometry to each status line so a failing geometry gate can be
+# diagnosed from the log.
+_DEBUG_GATES = os.environ.get("DMS_DEBUG_GATES") == "1"
 
 
 class PicameraCapture:
@@ -197,6 +202,15 @@ def _status_line(
         " ".join(f"{d.label}:{d.confidence:.2f}" for d in observation.detections)
         or "none"
     )
+    if _DEBUG_GATES:
+        found = (
+            " ".join(
+                f"{d.label}:{d.confidence:.2f}@{int(d.box[0])},{int(d.box[1])},"
+                f"{int(d.box[2])},{int(d.box[3])}"
+                for d in observation.detections
+            )
+            or "none"
+        )
     state_text, _ = summarize(face, analyzer.active_signals)
     blink_rate = analyzer.drowsiness.blink_rate(observation.timestamp)
     parts = [
@@ -204,10 +218,20 @@ def _status_line(
         f"state={state_text.replace(' - ', ': ')}",
         f"face={'yes' if face.present else 'no':>3}",
         f"ear={face.ear:5.3f} mar={face.mar:5.3f}",
+        f"closed={'yes' if analyzer.drowsiness.last_closed else 'no'} reliable={'yes' if analyzer.drowsiness.last_reliable else 'no'}",
         f"yaw={face.yaw:6.1f} pitch={face.pitch:6.1f} roll={face.roll:6.1f}",
         ref,
         f"det={found}",
     ]
+    if _DEBUG_GATES:
+        if face.bbox is not None:
+            parts.append(
+                "fbox=%d,%d,%d,%d" % tuple(int(v) for v in face.bbox)
+            )
+        if face.mouth_point is not None:
+            parts.append(
+                "mouth=%.0f,%.0f" % (face.mouth_point[0], face.mouth_point[1])
+            )
     if face.ear < 0.25 and (
         math.isfinite(face.ear_left) or math.isfinite(face.ear_right)
     ):

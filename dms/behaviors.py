@@ -32,6 +32,8 @@ class DrowsinessMonitor:
         self._absent = Sustained(thresholds.face_missing_s)
         self._closed_prev = False
         self._closed_run = 0
+        self._last_closed = False
+        self._last_reliable = False
         self._blink_start: float | None = None
         self._nod_start: float | None = None
         self._neutral_pitch: float | None = None
@@ -46,6 +48,7 @@ class DrowsinessMonitor:
 
         # Learn neutral pitch from usable frames.
         reliable = present and self._plausible(face)
+        self._last_reliable = bool(reliable)
         if reliable and math.isfinite(face.pitch):
             if len(self._pitch_samples) < 30:
                 self._pitch_samples.append(face.pitch)
@@ -61,6 +64,7 @@ class DrowsinessMonitor:
             self._closed_prev = False
             self._closed_run = 0
             self._blink_start = None
+            self._last_closed = False
             self._perclos.prune(now)
             if not present:
                 return self._signals(now, absent, 0.0, False, False, False)
@@ -74,6 +78,7 @@ class DrowsinessMonitor:
         # eyelid is shut. The per-eye values remain in the status line for
         # diagnosis.
         closed = face.ear < th.ear_closed
+        self._last_closed = bool(closed)
         self._closed_run = self._closed_run + 1 if closed else 0
         self._perclos.push(now, face.ear)
         self._track_blink(now, closed)
@@ -115,7 +120,7 @@ class DrowsinessMonitor:
             return False
         if face.ear > th.drowsy_valid_ear_max or face.mar > th.drowsy_valid_mar_max:
             return False
-        if math.isfinite(face.yaw) and abs(face.yaw) > th.drowsy_max_yaw_deg:
+        if math.isfinite(face.yaw) and abs(face.yaw) > 90.0:
             return False
         if math.isfinite(face.pitch) and abs(face.pitch) > th.drowsy_max_pitch_deg:
             return False
@@ -158,6 +163,14 @@ class DrowsinessMonitor:
                 yawning,
             ),
         ]
+
+    @property
+    def last_closed(self) -> bool:
+        return self._last_closed
+
+    @property
+    def last_reliable(self) -> bool:
+        return self._last_reliable
 
     @property
     def eyes_closed(self) -> bool:
@@ -209,10 +222,14 @@ class SmokingMonitor:
         self.th = thresholds
         self.detector_has_cigarette = detector_has_cigarette
         self._strong = Sustained(
-            thresholds.cigarette_s, hold_s=thresholds.cigarette_hold_s
+            thresholds.cigarette_s,
+            hold_s=thresholds.cigarette_hold_s,
+            bridge_s=thresholds.cigarette_bridge_s,
         )
         self._weak = Sustained(
-            thresholds.cigarette_low_s, hold_s=thresholds.cigarette_hold_s
+            thresholds.cigarette_low_s,
+            hold_s=thresholds.cigarette_hold_s,
+            bridge_s=thresholds.cigarette_bridge_s,
         )
 
     def candidate(self, detection: Detection, face: FaceObservation) -> bool:
@@ -265,11 +282,16 @@ class SmokingMonitor:
 
     def _near_face(self, detection: Detection, face: FaceObservation) -> bool:
         # Anchored to the mouth, not the face box: a hand or phone at the ear
-        # sits inside a generous face box but far from the mouth. Labelled
-        # positives land ~0.1-0.13 face-heights from the mouth point; the gate
-        # is wider so a cigarette held at the lips or just below the chin is
-        # not lost when the detector box includes part of the hand.
+        # sits inside a generous face box but far from the mouth. The check is
+        # the distance from the box edge to the mouth point, not the box
+        # centre: a real cigarette is long, so its centre can sit well to the
+        # side of the lips while the lit end still touches them.
         if face.bbox is None:
+            return False
+        # A wide-open mouth is a yawn, not a cigarette at the lips. The hand
+        # often comes to the mouth during a yawn and the cigarette model can
+        # fire on fingers; ignore boxes while the mouth is wide open.
+        if face.mar >= self.th.yawn_mar:
             return False
         span = face.bbox[3] - face.bbox[1]
         if span <= 0:
@@ -283,21 +305,14 @@ class SmokingMonitor:
         aspect = max(width, height) / min(width, height)
         if aspect < self.th.cigarette_min_aspect:
             return False
-        cx, cy = detection.center
-        mouth = face.mouth_point
-        if mouth is None:
+        if face.mouth_point is None:
+            cx, cy = detection.center
             x1, y1, x2, y2 = face.bbox
             return (
                 x1 - 0.75 * span <= cx <= x2 + 0.75 * span
                 and y1 - 0.5 * span <= cy <= y2 + 0.75 * span
             )
-        mx, my = mouth
-        gate = self.th.cigarette_gate_span
-        # Keep this tight around the lips. A phone at the ear is ~0.45
-        # face-heights out, and hands at the chin land around 0.5; the default
-        # 0.30 still covers a cigarette at the lips or just below them.
-        if abs(cx - mx) > gate * span or abs(cy - my) > gate * span:
-            return False
+        mx, my = face.mouth_point
         bx1, by1, bx2, by2 = detection.box
         dx = max(bx1 - mx, 0.0, mx - bx2)
         dy = max(by1 - my, 0.0, my - by2)
@@ -550,8 +565,8 @@ class DistractionMonitor:
         if max(width, height) > self.th.phone_max_size_span * span:
             return False
         return (
-            x1 - 0.40 * span <= cx <= x2 + 0.40 * span
-            and y1 - 0.25 * span <= cy <= y2 + 1.0 * span
+            x1 - 0.55 * span <= cx <= x2 + 0.55 * span
+            and y1 - 0.40 * span <= cy <= y2 + 1.0 * span
         )
 
     def _at_ear(self, detection: Detection, face: FaceObservation) -> bool:

@@ -74,11 +74,19 @@ class Sustained:
     an already-active condition on through gaps shorter than that, which is
     what stops one missed detector pass from silencing a smoking or phone
     warning. The onset still uses `duration_s`; the hold only delays release.
+
+    `bridge_s` applies before activation: a gap shorter than it keeps the
+    onset timer running instead of restarting from zero. That matters on a Pi
+    where the face loop can skip a detector result for one frame between two
+    slow passes.
     """
 
-    def __init__(self, duration_s: float, hold_s: float = 0.0):
+    def __init__(
+        self, duration_s: float, hold_s: float = 0.0, bridge_s: float = 0.0
+    ):
         self.duration_s = float(duration_s)
         self.hold_s = float(hold_s)
+        self.bridge_s = float(bridge_s)
         self._since: float | None = None
         self._last_true: float | None = None
         self._active = False
@@ -91,9 +99,12 @@ class Sustained:
             if not self._active and (now - self._since) >= self.duration_s:
                 self._active = True
             return self._active
-        if self._active and self._last_true is not None:
-            if (now - self._last_true) < self.hold_s:
-                return True
+        if self._last_true is not None:
+            grace = self.hold_s if self._active else self.bridge_s
+            if (now - self._last_true) < grace:
+                # Keep `_since`/`_last_true` so a brief miss does not throw
+                # away the evidence already accumulated.
+                return self._active
         self._since = None
         self._last_true = None
         self._active = False

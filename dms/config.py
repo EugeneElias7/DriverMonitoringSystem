@@ -111,6 +111,9 @@ class Thresholds:
     cigarette_max_size_span: float = 0.55
     # Cigarettes are elongated; a watch, ring or round pen cap is not. The
     # default 1.0 disables the check (PC profile); the Pi profile raises it.
+    # A cigarette seen end-on is nearly square (live Pi boxes measured 1.21),
+    # so the Pi uses 1.2. Phone false boxes are usually below that or far
+    # from the mouth.
     cigarette_min_aspect: float = 1.0
     # The mouth point must lie within this many face heights of the box
     # (zero when the mouth is inside it). A cigarette at the lips overlaps
@@ -119,6 +122,11 @@ class Thresholds:
     cigarette_mouth_pad_span: float = 1.0
     # Bridge one missed detector pass without re-announcing a finished puff.
     cigarette_hold_s: float = 1.0
+    # On a loaded Pi the face loop can miss a detector result for one frame
+    # before the smoking timer has confirmed. Keep the onset timer alive
+    # across that brief gap instead of restarting from zero. This is shorter
+    # than `cigarette_hold_s` and only applies before the alert is active.
+    cigarette_bridge_s: float = 0.0
 
     # --- drinking ---
     drinking_s: float = 1.5
@@ -187,9 +195,9 @@ class AppConfig:
     # keeps face/drowsiness frames arriving while a YOLO pass runs.
     opencv_threads: int = 0
     # Run at most one detector forward pass at a time, in detector-list order
-    # (lowest index first). OpenCV DNN saturates every core, so on a Pi 3 two
-    # concurrent passes each take as long as running both back to back. This
-    # keeps each pass near its isolated cost; the PC has cores to spare.
+    # (lowest index first). Kept as a debugging/fallback option: with
+    # opencv_threads=1 the Pi runs both models concurrently in ~6.8 s, while
+    # serializing them doubled the full cycle to ~12.5 s.
     serialize_detectors: bool = False
     # Face-first scheduling: while the eyes are closed or the face is missing,
     # stop starting detector passes so the CPU goes to the face/drowsiness

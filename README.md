@@ -156,11 +156,10 @@ only the runtime files.
 `config_pi.json` enables only the cigarette and phone detectors. The Pi
 profile also:
 
-- serializes detector passes through a priority gate, so two YOLO forwards
-  never fight over the four Cortex-A53 cores;
-- caps OpenCV at `opencv_threads: 2`: on this Pi 3 that is faster and more
-  consistent than 3 threads (less memory-bandwidth contention) and draws a
-  smaller current spike, so the 5 V rail is less likely to collapse;
+- runs the two YOLO models on separate worker threads, each capped at
+  `opencv_threads: 1`, so both passes finish in roughly the time of one
+  (~6.4 s and ~6.8 s measured concurrently on this throttled Pi 3) instead of
+  sharing a serialized gate (~12.5 s for a full cycle);
 - captures at `target_fps: 5`, enough for the face loop without running the
   camera pipeline flat out;
 - uses face-first scheduling (`face_first: true`): the moment the eyes close
@@ -326,24 +325,21 @@ order.
 ## Notes and limits
 
 - Object detectors run on background threads, so a slow Pi does not freeze the
-  face loop. Each detector has its own `target_hz`; on the Pi one shared gate
-  serializes passes in list order (phone, then cigarette), and face-first
-  scheduling pauses new passes while the eyes are closed or no face is
-  visible.
+  face loop. Each detector has its own `target_hz`; the Pi runs the cigarette
+  and phone models in parallel, and face-first scheduling pauses new passes
+  while the eyes are closed or no face is visible.
 - The face path is the priority. Alert audio is held in a priority queue with
   drowsiness first, phone second, smoking third. A phrase already playing is
   not interrupted, so the worst extra delay is one ~1.9 s phrase.
-- Measured on this Pi 3: ~1.5 processed frames/s headless, ~1.8 s per
-  640-pixel cigarette pass at 1.2 GHz with 2 threads (roughly double while
-  actively throttled), ~287 MB resident memory, 50-64 °C. Three threads were
-  slower and drew a larger current spike. The CPU and the 5 V supply are the
-  limits, not RAM or disk.
-- Object latency is set by the two 640-pixel passes sharing one gate: each
-  detector gets a pass about every 4-5 s at the full clock, so a phone or
-  cigarette alert typically appears in 4-6 s (about double while throttled).
-  Sub-second object alerts need a Pi 4/5, a smaller re-exported model, or an
-  accelerator; the sleep path is the only one designed to confirm in under a
-  second on this board.
+- Measured on this Pi 3 while throttled to 600 MHz: ~1.0 face frame/s headless,
+  ~6.4 s for the cigarette pass and ~6.8 s for the phone pass running
+  concurrently with `opencv_threads: 1`, ~287 MB resident memory, 50-64 °C.
+  The CPU and the 5 V supply are the limits, not RAM or disk.
+- Object latency is set by the two 640-pixel forwards: both refresh about every
+  7 s while throttled, so a phone or cigarette alert typically appears in
+  7-9 s. A single serialized cycle was ~12.5 s. Sub-second object alerts need a
+  Pi 4/5, a smaller re-exported model, or an accelerator; the sleep path is the
+  only one designed to confirm in under a second on this board.
 - The preview window is optional. If highgui cannot open a display, the app
   prints a note and continues headless instead of blocking.
 - The models are trained for a driver-facing camera. A laptop webcam is a

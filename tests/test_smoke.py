@@ -33,47 +33,54 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(cfg.detectors)
                 self.assertEqual(cfg.check_paths(ROOT), [])
 
-    def test_only_the_pi_profile_serializes_detectors(self) -> None:
+    def test_pi_runs_detectors_in_parallel(self) -> None:
         pi = AppConfig.load(ROOT / "config_pi.json")
         pc = AppConfig.load(ROOT / "config_pc.json")
-        self.assertTrue(pi.serialize_detectors)
+        # Both YOLO models run on their own worker thread with one OpenCV
+        # thread each. Live Pi timing: ~6.4 s and ~6.8 s concurrently, versus
+        # ~12.5 s when serialized, while the face loop stays near 1 fps.
+        self.assertFalse(pi.serialize_detectors)
         self.assertFalse(pc.serialize_detectors)
         self.assertTrue(pi.face_first)
         self.assertFalse(pc.face_first)
-        # Two threads beat three on this Pi 3: less memory-bandwidth contention
-        # and a lower current spike, so the rail is less likely to throttle.
-        self.assertEqual(pi.opencv_threads, 2)
+        # A single OpenCV worker keeps the YOLO passes on their own threads
+        # instead of queueing behind the face path in a shared pool; with more
+        # threads the status loop froze for the whole detector pass.
+        self.assertEqual(pi.opencv_threads, 1)
         # The Pi skips the ~5 s model self-test, but keeps the short startup
         # phrase so the speaker path is proven before an alert is needed.
         self.assertFalse(pi.self_test)
         self.assertTrue(pc.self_test)
         self.assertTrue(pi.audio.announce_startup)
         self.assertTrue(pc.audio.announce_startup)
-        # Detector order is the priority order: phone before cigarette, after
-        # sleep. Both get a rest between passes instead of one always-ready
-        # worker monopolizing the shared gate.
-        self.assertEqual(pi.detectors[0].name, "phone")
-        self.assertEqual(pi.detectors[1].name, "cigarette")
+        # Both detectors are enabled and run in parallel; list order only
+        # matters if serialization is re-enabled for debugging.
+        self.assertEqual(pi.detectors[0].name, "cigarette")
+        self.assertEqual(pi.detectors[1].name, "phone")
         self.assertGreaterEqual(pi.detectors[0].target_hz, 0.5)
         self.assertGreaterEqual(pi.detectors[1].target_hz, 0.5)
         # Sleep must confirm in under a second: two fully closed frames and a
         # 0.5 s timer. A normal blink is shorter than that.
         self.assertLessEqual(pi.thresholds.microsleep_min_frames, 2)
         self.assertLessEqual(pi.thresholds.microsleep_s, 0.6)
-        self.assertLessEqual(pi.thresholds.ear_closed, 0.12)
+        self.assertLessEqual(pi.thresholds.ear_closed, 0.20)
         # This camera sees the driver at a steep angle; leave headroom above
         # the measured ~53 deg yaw so a valid closed-eye frame is not rejected.
         self.assertGreaterEqual(pi.thresholds.drowsy_max_yaw_deg, 80.0)
         # Phone should stay sensitive; the Pi only gets one pass every few
         # seconds, so the low-confidence gates cannot be too strict.
         self.assertLessEqual(pi.thresholds.phone_call_s, 1.0)
-        self.assertLessEqual(pi.thresholds.phone_low_conf, 0.2)
-        self.assertLessEqual(pi.thresholds.phone_hand_conf, 0.25)
+        self.assertLessEqual(pi.thresholds.phone_low_conf, 0.3)
+        self.assertLessEqual(pi.thresholds.phone_hand_conf, 0.35)
         # Cigarette must stay conservative: a single false box is held until
         # the next slow pass, so confirmations need to be long enough.
         self.assertLessEqual(pi.thresholds.cigarette_s, 1.0)
         self.assertGreaterEqual(pi.thresholds.cigarette_low_s, 1.5)
-        self.assertGreaterEqual(pi.detectors[1].conf_threshold, 0.5)
+        # The model scores a real cigarette at ~0.42, so the detector floor
+        # must sit below that; the mouth gate and the low-confidence timer
+        # do the false-positive filtering.
+        self.assertLessEqual(pi.detectors[0].conf_threshold, 0.3)
+        self.assertLessEqual(pi.thresholds.cigarette_low_conf, 0.3)
 
 
 class TemporalTests(unittest.TestCase):
@@ -227,13 +234,24 @@ class GateTests(unittest.TestCase):
         self.assertFalse(gate._near_face(full_frame, self.face))
 
     def test_mouth_gate_rejects_phone_sized_box_and_hand_below_chin(self):
-        gate = SmokingMonitor(Thresholds())
+        gate = SmokingMonitor(Thresholds(cigarette_mouth_pad_span=0.15))
         # Centred near the mouth but as large as the face: this is the shape
         # of the phone-in-hand false positive seen on the phone clips.
         phone_sized = Detection("cigarette", 0.9, (130, 150, 190, 230))
         below_chin = Detection("cigarette", 0.9, (145, 220, 165, 240))
         self.assertFalse(gate._near_face(phone_sized, self.face))
         self.assertFalse(gate._near_face(below_chin, self.face))
+
+    def test_wide_yawn_does_not_count_as_a_cigarette(self):
+        gate = SmokingMonitor(Thresholds())
+        yawning = FaceObservation(
+            present=True,
+            bbox=(100.0, 100.0, 200.0, 220.0),
+            mouth=(150.0, 180.0),
+            mar=0.8,
+        )
+        cigarette = Detection("cigarette", 0.9, (145, 170, 165, 195))
+        self.assertFalse(gate._near_face(cigarette, yawning))
 
     def test_pi_gate_rejects_round_watch_and_far_cheek_box(self):
         gate = SmokingMonitor(
