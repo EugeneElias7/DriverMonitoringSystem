@@ -173,6 +173,10 @@ class DrowsinessMonitor:
         return self._last_reliable
 
     @property
+    def closed_run(self) -> int:
+        return self._closed_run
+
+    @property
     def eyes_closed(self) -> bool:
         """True while the current run of closed-eye frames is unbroken.
 
@@ -199,6 +203,111 @@ class DrowsinessMonitor:
         if span < 1.0:
             return math.nan
         return count * 60.0 / span
+
+
+def mouth_anchor(face: FaceObservation) -> tuple[float, float, float] | None:
+    """Mouth point plus face span; falls back to a box-derived anchor
+    when landmark points are unavailable (scripted sources, tests)."""
+    if face.bbox is None:
+        return None
+    x1, y1, x2, y2 = face.bbox
+    span = y2 - y1
+    mouth = face.mouth_point
+    if mouth is None:
+        return (x1 + x2) / 2, y2 - 0.25 * span, span
+    return mouth[0], mouth[1], span
+
+
+def cigarette_at_mouth(
+    detection: Detection, face: FaceObservation, th: Thresholds
+) -> bool:
+    """Cigarette geometry gate shared by the monitor and conflict resolver."""
+    # Anchored to the mouth, not the face box: a hand or phone at the ear
+    # sits inside a generous face box but far from the mouth. The check is
+    # the distance from the box edge to the mouth point, not the box
+    # centre: a real cigarette is long, so its centre can sit well to the
+    # side of the lips while the lit end still touches them.
+    if face.bbox is None:
+        return False
+    # A wide-open mouth is a yawn, not a cigarette at the lips. The hand
+    # often comes to the mouth during a yawn and the cigarette model can
+    # fire on fingers; ignore boxes while the mouth is wide open.
+    if face.mar >= th.yawn_mar:
+        return False
+    span = face.bbox[3] - face.bbox[1]
+    if span <= 0:
+        return False
+    width = detection.box[2] - detection.box[0]
+    height = detection.box[3] - detection.box[1]
+    if max(width, height) > th.cigarette_max_size_span * span:
+        return False
+    if width <= 0 or height <= 0:
+        return False
+    aspect = max(width, height) / min(width, height)
+    if aspect < th.cigarette_min_aspect:
+        return False
+    if face.mouth_point is None:
+        cx, cy = detection.center
+        x1, y1, x2, y2 = face.bbox
+        return (
+            x1 - 0.75 * span <= cx <= x2 + 0.75 * span
+            and y1 - 0.5 * span <= cy <= y2 + 0.75 * span
+        )
+    mx, my = face.mouth_point
+    bx1, by1, bx2, by2 = detection.box
+    dx = max(bx1 - mx, 0.0, mx - bx2)
+    dy = max(by1 - my, 0.0, my - by2)
+    return math.hypot(dx, dy) <= th.cigarette_mouth_pad_span * span
+
+
+def phone_near_face(
+    detection: Detection, face: FaceObservation, th: Thresholds
+) -> bool:
+    """Phone box in the face/upper-chest region, i.e. being held."""
+    if face.bbox is None:
+        return False
+    x1, y1, x2, y2 = face.bbox
+    span = y2 - y1
+    if span <= 0:
+        return False
+    cx, cy = detection.center
+    width = detection.box[2] - detection.box[0]
+    height = detection.box[3] - detection.box[1]
+    # A full-frame box is a model failure, not a phone in the hand.
+    if max(width, height) > th.phone_max_size_span * span:
+        return False
+    # A cigarette-sized box is not a phone. The COCO model frequently
+    # relabels a cigarette/hand as a phone; those boxes are much smaller
+    # than a real handset (live Pi: cigarette ~0.23-0.31 face-heights,
+    # real phone at the ear ~0.73).
+    if max(width, height) < th.phone_min_size_span * span:
+        return False
+    return (
+        x1 - th.phone_face_margin_span * span <= cx <= x2 + th.phone_face_margin_span * span
+        and y1 - 0.40 * span <= cy <= y2 + 1.0 * span
+    )
+
+
+def phone_at_ear(
+    detection: Detection, face: FaceObservation, th: Thresholds
+) -> bool:
+    anchor = mouth_anchor(face)
+    if anchor is None:
+        return False
+    mx, my, span = anchor
+    if span <= 0:
+        return False
+    width = detection.box[2] - detection.box[0]
+    height = detection.box[3] - detection.box[1]
+    if max(width, height) > th.phone_max_size_span * span:
+        return False
+    if max(width, height) < th.phone_min_size_span * span:
+        return False
+    cx, cy = detection.center
+    for ear_x in (mx - 0.45 * span, mx + 0.45 * span):
+        if abs(cx - ear_x) <= 0.35 * span and abs(cy - (my - 0.25 * span)) <= 0.35 * span:
+            return True
+    return False
 
 
 class SmokingMonitor:
@@ -269,54 +378,10 @@ class SmokingMonitor:
 
     @staticmethod
     def _mouth_anchor(face: FaceObservation) -> tuple[float, float, float] | None:
-        """Mouth point plus face span; falls back to a box-derived anchor
-        when landmark points are unavailable (scripted sources, tests)."""
-        if face.bbox is None:
-            return None
-        x1, y1, x2, y2 = face.bbox
-        span = y2 - y1
-        mouth = face.mouth_point
-        if mouth is None:
-            return (x1 + x2) / 2, y2 - 0.25 * span, span
-        return mouth[0], mouth[1], span
+        return mouth_anchor(face)
 
     def _near_face(self, detection: Detection, face: FaceObservation) -> bool:
-        # Anchored to the mouth, not the face box: a hand or phone at the ear
-        # sits inside a generous face box but far from the mouth. The check is
-        # the distance from the box edge to the mouth point, not the box
-        # centre: a real cigarette is long, so its centre can sit well to the
-        # side of the lips while the lit end still touches them.
-        if face.bbox is None:
-            return False
-        # A wide-open mouth is a yawn, not a cigarette at the lips. The hand
-        # often comes to the mouth during a yawn and the cigarette model can
-        # fire on fingers; ignore boxes while the mouth is wide open.
-        if face.mar >= self.th.yawn_mar:
-            return False
-        span = face.bbox[3] - face.bbox[1]
-        if span <= 0:
-            return False
-        width = detection.box[2] - detection.box[0]
-        height = detection.box[3] - detection.box[1]
-        if max(width, height) > self.th.cigarette_max_size_span * span:
-            return False
-        if width <= 0 or height <= 0:
-            return False
-        aspect = max(width, height) / min(width, height)
-        if aspect < self.th.cigarette_min_aspect:
-            return False
-        if face.mouth_point is None:
-            cx, cy = detection.center
-            x1, y1, x2, y2 = face.bbox
-            return (
-                x1 - 0.75 * span <= cx <= x2 + 0.75 * span
-                and y1 - 0.5 * span <= cy <= y2 + 0.75 * span
-            )
-        mx, my = face.mouth_point
-        bx1, by1, bx2, by2 = detection.box
-        dx = max(bx1 - mx, 0.0, mx - bx2)
-        dy = max(by1 - my, 0.0, my - by2)
-        return math.hypot(dx, dy) <= self.th.cigarette_mouth_pad_span * span
+        return cigarette_at_mouth(detection, face, self.th)
 
 
 class DrinkingMonitor:
@@ -551,37 +616,146 @@ class DistractionMonitor:
         ]
 
     def _near_face(self, detection: Detection, face: FaceObservation) -> bool:
-        """Phone box in the face/upper-chest region, i.e. being held."""
-        if face.bbox is None:
-            return False
-        x1, y1, x2, y2 = face.bbox
-        span = y2 - y1
-        if span <= 0:
-            return False
-        cx, cy = detection.center
-        width = detection.box[2] - detection.box[0]
-        height = detection.box[3] - detection.box[1]
-        # A full-frame box is a model failure, not a phone in the hand.
-        if max(width, height) > self.th.phone_max_size_span * span:
-            return False
-        return (
-            x1 - 0.55 * span <= cx <= x2 + 0.55 * span
-            and y1 - 0.40 * span <= cy <= y2 + 1.0 * span
-        )
+        return phone_near_face(detection, face, self.th)
 
     def _at_ear(self, detection: Detection, face: FaceObservation) -> bool:
-        anchor = SmokingMonitor._mouth_anchor(face)
-        if anchor is None:
-            return False
-        mx, my, span = anchor
-        if span <= 0:
-            return False
-        width = detection.box[2] - detection.box[0]
-        height = detection.box[3] - detection.box[1]
-        if max(width, height) > self.th.phone_max_size_span * span:
-            return False
-        cx, cy = detection.center
-        for ear_x in (mx - 0.45 * span, mx + 0.45 * span):
-            if abs(cx - ear_x) <= 0.35 * span and abs(cy - (my - 0.25 * span)) <= 0.35 * span:
+        return phone_at_ear(detection, face, self.th)
+
+
+def resolve_cigarette_phone_conflicts(
+    detections: list[Detection],
+    face: FaceObservation,
+    th: Thresholds,
+) -> list[Detection]:
+    """Drop the weaker label when a cigarette and phone box are one object.
+
+    The COCO phone model frequently fires on a cigarette, the hand holding it,
+    or the cheek beside it. The dedicated cigarette model then fires on the
+    same region. When a cigarette box passes the mouth gate, it is compared
+    with each phone box:
+
+    * overlap/containment, a phone box at the ear, or a phone centred at the
+      lips counts as a conflict;
+    * a large phone box (``phone_strong_size_span``) is a real handset even
+      at lower confidence, so sitting at the ear does not make it a conflict;
+    * a small phone box that conflicts with the cigarette is dropped even at
+      high confidence, because it is much more likely to be the cigarette or
+      the hand holding it;
+    * a strong phone (``phone_strong_conf``) that is clearly more confident
+      than the cigarette wins, so a real phone is not hidden by a weak
+      cigarette box;
+    * otherwise the phone is dropped, because a phone box on the cigarette is
+      much more likely to be the cigarette/hand;
+    * when both labels are strong, both are kept so neither real alert is
+      suppressed.
+
+    Only phone boxes at or above ``phone_low_conf`` are considered, and only
+    cigarettes at or above ``cigarette_suppress_conf`` that pass the full
+    smoking geometry gate can suppress a phone.
+    """
+    cigarettes = [
+        d
+        for d in detections
+        if d.label == "cigarette"
+        and d.confidence >= th.cigarette_suppress_conf
+        and cigarette_at_mouth(d, face, th)
+    ]
+    if not cigarettes:
+        return detections
+    phones = [
+        d
+        for d in detections
+        if d.label in PHONE_LABELS and d.confidence >= th.phone_low_conf
+    ]
+    if not phones:
+        return detections
+
+    dropped: set[Detection] = set()
+    for phone in phones:
+        conflicts = [
+            cigarette
+            for cigarette in cigarettes
+            if _cigarette_phone_conflict(phone, cigarette, face, th)
+        ]
+        if not conflicts:
+            continue
+        # On the Pi, a cigarette-sized box is not a handset no matter how
+        # confident the phone model is. Without this veto a 0.60+ false box
+        # on the cigarette could outvote a real cigarette (`phone_wins`) and
+        # raise a phone alert. Large real handsets skip this branch.
+        if th.phone_strong_size_span > 0 and not _is_large_phone(phone, face, th):
+            dropped.add(phone)
+            continue
+        strongest = max(conflicts, key=lambda d: d.confidence)
+        both_strong = (
+            phone.confidence >= th.phone_strong_conf
+            and strongest.confidence >= th.cigarette_high_conf
+        )
+        phone_wins = (
+            phone.confidence >= th.phone_strong_conf
+            and phone.confidence >= strongest.confidence + th.phone_cigarette_margin
+        )
+        if both_strong:
+            continue
+        if phone_wins:
+            dropped.update(conflicts)
+        else:
+            dropped.add(phone)
+
+    if not dropped:
+        return detections
+    return [d for d in detections if d not in dropped]
+
+
+def _cigarette_phone_conflict(
+    phone: Detection,
+    cigarette: Detection,
+    face: FaceObservation,
+    th: Thresholds,
+) -> bool:
+    if _iou(phone, cigarette) >= th.phone_cigarette_iou:
+        return True
+    px, py = phone.center
+    cx, cy = cigarette.center
+    if _box_contains(phone.box, cx, cy) or _box_contains(cigarette.box, px, py):
+        return True
+    if phone_at_ear(phone, face, th):
+        if not _is_large_phone(phone, face, th):
+            return True
+    if face.mouth_point is not None and face.bbox is not None:
+        span = face.bbox[3] - face.bbox[1]
+        if span > 0:
+            mx, my = face.mouth_point
+            if math.hypot(px - mx, py - my) <= th.cigarette_mouth_pad_span * span:
                 return True
+    return False
+
+
+def _iou(a: Detection, b: Detection) -> float:
+    ax1, ay1, ax2, ay2 = a.box
+    bx1, by1, bx2, by2 = b.box
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _box_contains(box: tuple[int, int, int, int], x: float, y: float) -> bool:
+    x1, y1, x2, y2 = box
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def _is_large_phone(
+    phone: Detection, face: FaceObservation, th: Thresholds
+) -> bool:
+    if th.phone_strong_size_span <= 0 or face.bbox is None:
         return False
+    span = face.bbox[3] - face.bbox[1]
+    if span <= 0:
+        return False
+    width = phone.box[2] - phone.box[0]
+    height = phone.box[3] - phone.box[1]
+    return max(width, height) >= th.phone_strong_size_span * span

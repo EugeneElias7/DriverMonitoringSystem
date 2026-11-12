@@ -17,6 +17,8 @@ from typing import Any
 @dataclass
 class FaceConfig:
     detector_model_path: str = "models/face_detection_yunet_2023mar.onnx"
+    # Fallback only. The active 478-point model is loaded from
+    # models/face_landmarks.onnx by create_face_analyzer() when it exists.
     landmark_model_path: str = "models/2d106det.onnx"
     min_detection_confidence: float = 0.2
 
@@ -111,9 +113,9 @@ class Thresholds:
     cigarette_max_size_span: float = 0.55
     # Cigarettes are elongated; a watch, ring or round pen cap is not. The
     # default 1.0 disables the check (PC profile); the Pi profile raises it.
-    # A cigarette seen end-on is nearly square (live Pi boxes measured 1.21),
-    # so the Pi uses 1.2. Phone false boxes are usually below that or far
-    # from the mouth.
+    # A cigarette seen end-on is nearly square; live Pi boxes measured
+    # 1.16-1.21, so the Pi uses 1.15. Phone false boxes are usually below
+    # that or far from the mouth.
     cigarette_min_aspect: float = 1.0
     # The mouth point must lie within this many face heights of the box
     # (zero when the mouth is inside it). A cigarette at the lips overlaps
@@ -127,6 +129,25 @@ class Thresholds:
     # across that brief gap instead of restarting from zero. This is shorter
     # than `cigarette_hold_s` and only applies before the alert is active.
     cigarette_bridge_s: float = 0.0
+    # --- cigarette/phone label conflict ---
+    # The COCO phone model often fires on a cigarette or the hand holding it.
+    # When enabled, a cigarette box that passes the mouth gate suppresses a
+    # weaker overlapping phone box. A phone at or above `phone_strong_conf`
+    # that also passes the size test wins over a cigarette that is weaker by
+    # `phone_cigarette_margin`; a cigarette-sized phone box never wins. If
+    # both labels are strong and the phone is large, both are kept. Off by
+    # default; the Pi profile enables it because that camera sees both labels
+    # on one cigarette.
+    phone_cigarette_resolve: bool = False
+    cigarette_suppress_conf: float = 0.30
+    phone_strong_conf: float = 0.60
+    phone_cigarette_margin: float = 0.15
+    phone_cigarette_iou: float = 0.05
+    # A phone box this large relative to the face is a real handset even when
+    # its confidence is below `phone_strong_conf`. It is not treated as the
+    # same object as a cigarette merely because it sits at the ear. 0 disables
+    # the size exception; the Pi uses 0.55 (a live handset measured 0.73).
+    phone_strong_size_span: float = 0.0
 
     # --- drinking ---
     drinking_s: float = 1.5
@@ -162,9 +183,19 @@ class Thresholds:
     # Real in-hand boxes on the COCO phone model score 0.45-0.9; the 0.2 floor
     # keeps those while dropping the 0.1-0.15 boxes the model invents on hands.
     phone_hand_conf: float = 0.20
-    # Reject full-frame phone boxes: a held phone is never larger than the
-    # driver's face by this factor.
+    # Reject full-frame phone boxes: a held phone can be larger than the
+    # driver's face when it is close to the camera, but never as large as the
+    # whole frame. The Pi raises this to 1.5.
     phone_max_size_span: float = 1.2
+    # Reject tiny phone boxes: the COCO phone model sometimes labels the
+    # cigarette, fingers or cheek as a phone. A real handset at the ear is
+    # large relative to the face; a cigarette-sized box is not. 0 disables
+    # the check (PC profile); the Pi raises it.
+    phone_min_size_span: float = 0.0
+    # Horizontal margin around the face for the "phone in hand" gate, in face
+    # heights. A phone held in the left/right hand can sit beside the face;
+    # 0.55 is tight. The Pi widens it to 0.75.
+    phone_face_margin_span: float = 0.55
     # Keep the phone alert on through brief detector misses.
     phone_hold_s: float = 3.0
 

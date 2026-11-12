@@ -17,6 +17,8 @@ import cv2
 from .alerts import CsvAlertLog, console_sink
 from .audio import AudioAlerter
 from .config import AppConfig
+from .events import EventConfig, EventManager
+from .events.telegram_env import load_telegram_env
 from .pipeline import Analyzer, FrameObservation, Perception
 from .state import summarize
 
@@ -213,12 +215,19 @@ def _status_line(
         )
     state_text, _ = summarize(face, analyzer.active_signals)
     blink_rate = analyzer.drowsiness.blink_rate(observation.timestamp)
+    need = max(1, int(analyzer.cfg.thresholds.microsleep_min_frames))
+    run = min(analyzer.drowsiness.closed_run, need)
+    closed_text = "yes" if analyzer.drowsiness.last_closed else "no"
+    # Show the run length so a single closed sample (a blink) is visibly
+    # different from a microsleep. Capping at `need` keeps a long closure
+    # readable as run=2/2 rather than run=62/2.
+    closed_text += f" run={run}/{need}"
     parts = [
         f"[status] t={observation.timestamp:6.1f}s fps={fps:4.1f}",
         f"state={state_text.replace(' - ', ': ')}",
         f"face={'yes' if face.present else 'no':>3}",
         f"ear={face.ear:5.3f} mar={face.mar:5.3f}",
-        f"closed={'yes' if analyzer.drowsiness.last_closed else 'no'} reliable={'yes' if analyzer.drowsiness.last_reliable else 'no'}",
+        f"closed={closed_text} reliable={'yes' if analyzer.drowsiness.last_reliable else 'no'}",
         f"yaw={face.yaw:6.1f} pitch={face.pitch:6.1f} roll={face.roll:6.1f}",
         ref,
         f"det={found}",
@@ -490,6 +499,7 @@ def run(
     realtime: bool = False,
     loop: bool = False,
     record: str | None = None,
+    event_config: str | None = None,
 ) -> int:
     sinks = [console_sink]
     log = CsvAlertLog(cfg.log_path) if cfg.log_path else None
@@ -507,6 +517,7 @@ def run(
 
     perception: Perception | None = None
     analyzer: Analyzer | None = None
+    event_manager: EventManager | None = None
     cap: cv2.VideoCapture | PicameraCapture | None = None
     recorder: AnnotatedRecorder | None = None
     show = cfg.display
@@ -534,6 +545,32 @@ def run(
         analyzer = Analyzer(cfg, detector_labels=labels, sinks=sinks)
         for note in analyzer.notes:
             print(f"note: {note}", flush=True)
+        if event_config:
+            try:
+                load_telegram_env()
+                event_cfg = EventConfig.load(event_config)
+                event_manager = EventManager(vehicle_number=event_cfg.vehicle_number)
+                print(
+                    "note: evidence events enabled "
+                    f"(vehicle {event_cfg.vehicle_number}, "
+                    "images in evidence/, log in logs/events.jsonl)",
+                    flush=True,
+                )
+                if not event_manager.telegram_configured:
+                    print(
+                        "note: Telegram credentials not set; events will be "
+                        "logged with FAILED notification status",
+                        flush=True,
+                    )
+            except Exception as exc:
+                if event_manager is not None:
+                    event_manager.close()
+                    event_manager = None
+                print(
+                    "note: evidence events disabled "
+                    f"({type(exc).__name__}: {exc})",
+                    flush=True,
+                )
         power = _power_note()
         if power:
             print(f"note: {power}", flush=True)
@@ -572,6 +609,9 @@ def run(
                         flush=True,
                     )
                 break
+            # Keep the frame as delivered by the camera for evidence. The
+            # existing downscale below is for detection only.
+            evidence_frame = frame
             if frame.shape[1] > cfg.capture_width:
                 # Cameras often ignore the requested size; running the
                 # detectors at 720p costs ~3x for no accuracy gain.
@@ -585,6 +625,18 @@ def run(
 
             alerts = analyzer.update(observation)
             emitted.update(alert.key for alert in alerts)
+            if event_manager is not None:
+                try:
+                    event_manager.process(
+                        (signal.key for signal in analyzer.active_signals if signal.active),
+                        evidence_frame,
+                    )
+                except Exception as exc:
+                    # Evidence is an addition, never a reason to stop the DMS.
+                    print(
+                        f"note: evidence event skipped ({type(exc).__name__})",
+                        flush=True,
+                    )
             if cfg.face_first and perception is not None:
                 # Eyes closed or no face: stop starting YOLO passes and give
                 # the CPU to the next face frame. A pass already in flight
@@ -664,6 +716,8 @@ def run(
             cv2.destroyAllWindows()
         if recorder is not None:
             recorder.close()
+        if event_manager is not None:
+            event_manager.close()
         if analyzer is not None:
             analyzer.close()
         if perception is not None:
@@ -686,6 +740,16 @@ def build_parser() -> argparse.ArgumentParser:
         help='camera index ("0"), "picamera" (Pi CSI camera), or a video file path',
     )
     parser.add_argument("--config", help="path to a JSON config overriding defaults")
+    parser.add_argument(
+        "--event-config",
+        default="config_events.json",
+        help="vehicle number config for evidence events (default: config_events.json)",
+    )
+    parser.add_argument(
+        "--no-events",
+        action="store_true",
+        help="disable evidence images, JSONL events, and Telegram notifications",
+    )
     parser.add_argument("--log", help="write alerts to this CSV path")
     parser.add_argument(
         "--record",
@@ -701,12 +765,37 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="disable the seatbelt rule (desk tests have no belt in view)",
     )
+    parser.add_argument(
+        "--credits",
+        action="store_true",
+        help="print third-party model credits and exit",
+    )
     parser.add_argument("--dump-config", action="store_true", help="print the effective config and exit")
     return parser
 
 
+def _print_credits() -> None:
+    """Print the checked-in notices so a deployed device can show credits."""
+    notice = Path(__file__).resolve().parent.parent / "THIRD_PARTY_NOTICES.md"
+    try:
+        text = notice.read_text(encoding="utf-8")
+    except OSError:
+        text = (
+            "Third-party credits:\n"
+            "- YuNet face detector, (c) 2020 Shiqi Yu, MIT License.\n"
+            "- MediaPipe face landmarks, Google LLC, Apache License 2.0.\n"
+            "- InsightFace 2d106 fallback, non-commercial research use only.\n"
+            "- Ultralytics YOLO models and exports, AGPL-3.0.\n"
+            "Full notices are not installed; see THIRD_PARTY_NOTICES.md."
+        )
+    print(text, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.credits:
+        _print_credits()
+        return 0
     try:
         cfg = AppConfig.load(args.config)
     except (OSError, ValueError) as exc:
@@ -737,4 +826,5 @@ def main(argv: list[str] | None = None) -> int:
         realtime=args.realtime,
         loop=args.loop,
         record=args.record,
+        event_config=None if args.no_events else args.event_config,
     )

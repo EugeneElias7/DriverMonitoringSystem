@@ -15,3 +15,12 @@ camera-test.jpg
 *.mp4
 *.avi
 *.mov
+
+# Generated evidence and event records
+evidence/
+logs/
+
+# Local secrets (keep the example file tracked)
+.env
+.env.*
+!.env.example

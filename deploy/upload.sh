@@ -12,7 +12,8 @@ PI_DIR="${PI_DIR:-/home/sansolution/dms}"
 
 ssh "$PI_USER@$PI_HOST" "mkdir -p '$PI_DIR'"
 tar --exclude='__pycache__' --exclude='*.pyc' -czf - \
-    run.py requirements.txt config_pi.json README.md dms models audio tests \
+    run.py requirements.txt config_pi.json config_events.json README.md \
+    .env.example THIRD_PARTY_NOTICES.md licenses dms models audio tests tools \
     | ssh "$PI_USER@$PI_HOST" "tar -xzf - -C '$PI_DIR'"
 
 echo "uploaded to $PI_HOST:$PI_DIR"

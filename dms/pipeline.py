@@ -22,6 +22,7 @@ from .behaviors import (
     EatingMonitor,
     SeatbeltMonitor,
     SmokingMonitor,
+    resolve_cigarette_phone_conflicts,
 )
 from .config import AppConfig
 from .face import FaceObservation
@@ -240,6 +241,10 @@ class Analyzer:
 
     def update(self, observation: FrameObservation) -> list[Alert]:
         now = observation.timestamp
+        if self.cfg.thresholds.phone_cigarette_resolve:
+            observation.detections = resolve_cigarette_phone_conflicts(
+                observation.detections, observation.face, self.cfg.thresholds
+            )
         signals: list[ConditionSignal] = []
         signals += self.drowsiness.update(now, observation.face)
         signals += self.smoking.update(now, observation.face, observation.detections)
