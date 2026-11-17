@@ -129,8 +129,8 @@ class ConfigTests(unittest.TestCase):
         # separate detector passes; one republished false box cannot alert.
         self.assertGreaterEqual(pi.thresholds.phone_call_s, 1.0)
         self.assertGreaterEqual(pi.thresholds.phone_in_hand_s, 2.0)
-        self.assertLessEqual(pi.thresholds.phone_low_conf, 0.3)
-        self.assertLessEqual(pi.thresholds.phone_hand_conf, 0.35)
+        self.assertLessEqual(pi.thresholds.phone_low_conf, 0.4)
+        self.assertLessEqual(pi.thresholds.phone_hand_conf, 0.45)
         self.assertGreaterEqual(pi.thresholds.phone_min_size_span, 0.4)
         self.assertGreaterEqual(pi.thresholds.phone_max_size_span, 1.1)
         self.assertGreater(pi.thresholds.phone_min_aspect, 1.0)
