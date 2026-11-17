@@ -92,7 +92,10 @@
         0.95,
         1.0
       ]
-    }
+    },
+    "ir_gpio_pin": 18,
+    "ir_brightness_threshold": 0.8,
+    "ir_hysteresis": 0.05
   },
   "alert_cooldown_s": 5.0,
   "capture_width": 640,

@@ -49,7 +49,10 @@ class PicameraCapture:
     """
 
     def __init__(
-        self, width: int, height: int, fps: float, controls: dict | None = None
+        self, width: int, height: int, fps: float, controls: dict | None = None,
+        ir_gpio_pin: int | None = None,
+        ir_brightness_threshold: float = 0.8,
+        ir_hysteresis: float = 0.05,
     ):
         from picamera2 import Picamera2  # lazy: only the Pi uses this source
 
@@ -71,6 +74,22 @@ class PicameraCapture:
                 }
             )
         self.fps = float(fps)
+        # IR LED control via GPIO.
+        self._ir_pin = ir_gpio_pin
+        self._ir_threshold = float(ir_brightness_threshold)
+        self._ir_hysteresis = float(ir_hysteresis)
+        self._ir_active = False
+        self._ir_gpio = None
+        if self._ir_pin is not None:
+            try:
+                import RPi.GPIO as GPIO
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setwarnings(False)
+                GPIO.setup(self._ir_pin, GPIO.OUT, initial=GPIO.LOW)
+                self._ir_gpio = GPIO
+            except Exception as exc:
+                print(f"IR: GPIO setup failed on pin {self._ir_pin}: {exc}", flush=True)
+                self._ir_pin = None
 
     def read(self):
         try:
@@ -81,7 +100,36 @@ class PicameraCapture:
             frame = self._cam.capture_array("main", wait=2.0)
         except (RuntimeError, TimeoutError):
             return False, None
-        return True, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        self._update_ir(bgr)
+        return True, bgr
+
+    def _update_ir(self, bgr_frame) -> None:
+        """Toggle IR LEDs based on frame brightness."""
+        if self._ir_pin is None:
+            return
+        # Mean brightness of the frame (0-255).
+        gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+        brightness = float(gray.mean()) / 255.0
+        # Hysteresis: turn on below threshold, turn off above threshold + hysteresis.
+        if not self._ir_active and brightness < self._ir_threshold:
+            self._ir_active = True
+            try:
+                self._ir_gpio.output(self._ir_pin, self._ir_gpio.HIGH)
+            except Exception:
+                pass
+            print(f"IR: ON (brightness {brightness:.0%} < {self._ir_threshold:.0%})", flush=True)
+        elif self._ir_active and brightness > self._ir_threshold + self._ir_hysteresis:
+            self._ir_active = False
+            try:
+                self._ir_gpio.output(self._ir_pin, self._ir_gpio.LOW)
+            except Exception:
+                pass
+            print(f"IR: OFF (brightness {brightness:.0%} > {self._ir_threshold + self._ir_hysteresis:.0%})", flush=True)
+
+    @property
+    def ir_active(self) -> bool:
+        return self._ir_active
 
     def get(self, prop: int) -> float:
         return self.fps if prop == cv2.CAP_PROP_FPS else 0.0
@@ -89,15 +137,36 @@ class PicameraCapture:
     def set(self, prop: int, value: float) -> bool:
         return False
 
+    def close(self) -> None:
+        if self._ir_gpio is not None and self._ir_pin is not None:
+            try:
+                self._ir_gpio.output(self._ir_pin, self._ir_gpio.LOW)
+                self._ir_gpio.cleanup(self._ir_pin)
+            except Exception:
+                pass
+        try:
+            self._cam.stop()
+        except Exception:
+            pass
+        try:
+            self._cam.close()
+        except Exception:
+            pass
+
     def release(self) -> None:
-        self._cam.stop()
-        self._cam.close()
+        self.close()
 
 
 def _open_capture(spec: str, cfg: AppConfig) -> cv2.VideoCapture | PicameraCapture:
     if spec == "picamera":
         return PicameraCapture(
-            cfg.capture_width, cfg.capture_height, cfg.target_fps, cfg.camera.controls
+            cfg.capture_width,
+            cfg.capture_height,
+            cfg.target_fps,
+            cfg.camera.controls,
+            ir_gpio_pin=cfg.camera.ir_gpio_pin,
+            ir_brightness_threshold=cfg.camera.ir_brightness_threshold,
+            ir_hysteresis=cfg.camera.ir_hysteresis,
         )
     if spec.isdigit():
         index = int(spec)
@@ -191,6 +260,7 @@ def _status_line(
     analyzer: Analyzer,
     fps: float,
     perception: Perception | None,
+    cap: Any = None,
 ) -> str:
     """One line of every live value, for runs without a window (the Pi)."""
     face = observation.face
@@ -243,6 +313,10 @@ def _status_line(
         ref,
         f"det={found}",
     ]
+    # Show IR state when a PicameraCapture with GPIO IR is in use.
+    ir = getattr(cap, "ir_active", None)
+    if ir is not None:
+        parts.append(f"ir={'ON' if ir else 'off'}")
     if _DEBUG_GATES:
         if face.bbox is not None:
             parts.append(
@@ -681,7 +755,7 @@ def run(
             if not show and time.monotonic() - status_time >= 1.0:
                 status_time = time.monotonic()
                 print(
-                    _status_line(observation, analyzer, fps, perception),
+                    _status_line(observation, analyzer, fps, perception, cap),
                     flush=True,
                 )
 

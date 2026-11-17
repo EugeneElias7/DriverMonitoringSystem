@@ -243,6 +243,13 @@ class CameraConfig:
     # detectors were never trained on; fixed colour gains are the software
     # workaround. Keys are libcamera control names.
     controls: dict[str, Any] = field(default_factory=dict)
+    # GPIO pin (BCM numbering) driving the IR LED array. None disables
+    # software IR control (hardware LDR handles it). Common pins: 17, 18, 27.
+    ir_gpio_pin: int | None = None
+    # Turn IR on when mean frame brightness falls below this fraction of 255.
+    ir_brightness_threshold: float = 0.8
+    # Hysteresis band to avoid flickering around the threshold.
+    ir_hysteresis: float = 0.05
 
 
 @dataclass

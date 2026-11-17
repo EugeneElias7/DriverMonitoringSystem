@@ -170,10 +170,29 @@ ssh sansolution@192.168.1.14 "pkill -9 -f 'run.py'; sleep 2; bash /home/sansolut
 - Test aplay: `ssh sansolution@192.168.1.14 "aplay -D plughw:Headphones /home/sansolution/dms/audio/system_on.wav"`
 - Check audio device in config_pi.json: `"device": "plughw:Headphones"`
 
-### High temperature
-- Normal under load: 65-80 °C
-- If throttling (`throttled != 0x0`), check power supply (5V 2.5A+)
-- Reduce detector frequency or opencv_threads if needed
+### IR LED control
+The IR LEDs are controlled via GPIO pin 18 (configurable in `camera.ir_gpio_pin` in config_pi.json). They turn on automatically when frame brightness drops below 80% (configurable via `camera.ir_brightness_threshold`).
+
+```bash
+# Check IR status in the live log
+ssh sansolution@192.168.1.14 "tail -f /home/sansolution/dms/logs/app.log | grep ir="
+```
+
+### Test IR manually (Python on Pi)
+```bash
+ssh sansolution@192.168.1.14 "cd /home/sansolution/dms && .venv/bin/python -c '
+import RPi.GPIO as GPIO
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(18, GPIO.OUT)
+GPIO.output(18, GPIO.HIGH)
+print(\"IR ON\")
+import time; time.sleep(2)
+GPIO.output(18, GPIO.LOW)
+GPIO.cleanup(18)
+print(\"IR OFF\")
+'"
+```
+
 
 ### False detections
 - Check status line: `ear=`, `mar=`, `gap=`, `gapH=`, `det=`
