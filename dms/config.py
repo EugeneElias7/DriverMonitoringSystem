@@ -203,6 +203,11 @@ class Thresholds:
     # Real in-hand boxes on the COCO phone model score 0.45-0.9; the 0.2 floor
     # keeps those while dropping the 0.1-0.15 boxes the model invents on hands.
     phone_hand_conf: float = 0.20
+    # A phone at the ear must clear a higher bar: the COCO model frequently
+    # mislabels a hand at the ear as a phone, and those boxes score 0.25-0.35.
+    # Real handsets at the ear score 0.4+. 0 disables (falls back to
+    # phone_low_conf).
+    phone_ear_conf: float = 0.40
     # Reject full-frame phone boxes: a held phone can be larger than the
     # driver's face when it is close to the camera, but never as large as the
     # whole frame. The Pi raises this to 1.5.

@@ -699,7 +699,11 @@ class DistractionMonitor:
         # A phone is "in hand" when its box sits in the face/upper-chest gate.
         # A phone on the seat stays out.
         phone_in_hand = any(self._near_face(d, face) for d in held_phones)
-        phone_at_ear = any(self._at_ear(d, face) for d in phones)
+        phone_at_ear = any(
+            self._at_ear(d, face)
+            for d in phones
+            if d.confidence >= max(th.phone_low_conf, th.phone_ear_conf)
+        )
         held = [
             d
             for d in phones
