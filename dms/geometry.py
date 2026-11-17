@@ -64,6 +64,11 @@ def mouth_aspect_ratio(
     return _dist(upper, lower) / width
 
 
+def mouth_gap(points: np.ndarray, lips: tuple = MOUTH_LIPS) -> float:
+    """Inner-lip opening in pixels. A closed mouth is a few pixels."""
+    return _dist(points[lips[0]], points[lips[1]])
+
+
 def camera_matrix(image_size: tuple[int, int], focal_scale: float = 1.0) -> np.ndarray:
     h, w = image_size
     f = float(max(w, h)) * focal_scale

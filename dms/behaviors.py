@@ -32,6 +32,7 @@ class DrowsinessMonitor:
         self._absent = Sustained(thresholds.face_missing_s)
         self._closed_prev = False
         self._closed_run = 0
+        self._yawn_run = 0
         self._last_closed = False
         self._last_reliable = False
         self._blink_start: float | None = None
@@ -40,7 +41,9 @@ class DrowsinessMonitor:
         self._pitch_samples: list[float] = []
         self.blink_durations = TimeWindow(300.0, maxlen=128)
 
-    def update(self, now: float, face: FaceObservation) -> list[ConditionSignal]:
+    def update(
+        self, now: float, face: FaceObservation, phone_in_use: bool = False
+    ) -> list[ConditionSignal]:
         th = self.th
         present = face.present and math.isfinite(face.ear)
         # Absence is about the face detector, not a bad landmark pass.
@@ -63,12 +66,32 @@ class DrowsinessMonitor:
             self._yawn.update(now, False)
             self._closed_prev = False
             self._closed_run = 0
+            self._yawn_run = 0
             self._blink_start = None
             self._last_closed = False
             self._perclos.prune(now)
             if not present:
                 return self._signals(now, absent, 0.0, False, False, False)
             return self._signals(now, False, 0.0, False, False, False)
+
+        yawn_open = self._yawn_open(face)
+        if phone_in_use:
+            # Looking down at a phone reads as a partly shut eye and can bank
+            # seconds towards a false microsleep. While a valid phone is in
+            # use the phone alert owns the distraction; sleep evidence is
+            # skipped rather than carried over to fire the moment the phone
+            # is put down. Yawning still reports (a real yawn has a wide gap).
+            self._microsleep.update(now, False)
+            self._closed_prev = False
+            self._closed_run = 0
+            self._blink_start = None
+            self._last_closed = False
+            self._perclos.prune(now)
+            self._yawn_run = self._yawn_run + 1 if yawn_open else 0
+            yawning = self._yawn.update(now, yawn_open) and self._yawn_run >= max(
+                1, int(th.yawn_min_frames)
+            )
+            return self._signals(now, False, 0.0, False, yawning, False)
 
         # Use the averaged EAR, which is already robust against a single bad
         # eyelid: to get the average below the closed bar, both eyes must be
@@ -101,7 +124,10 @@ class DrowsinessMonitor:
         microsleep = microsleep and self._closed_run >= max(
             1, int(th.microsleep_min_frames)
         )
-        yawning = self._yawn.update(now, face.mar > th.yawn_mar)
+        self._yawn_run = self._yawn_run + 1 if yawn_open else 0
+        yawning = self._yawn.update(now, yawn_open) and self._yawn_run >= max(
+            1, int(th.yawn_min_frames)
+        )
         # Nodding counts as drowsiness (microsleep).
         if nodding:
             microsleep = self._microsleep.update(now, True) or microsleep
@@ -124,6 +150,21 @@ class DrowsinessMonitor:
             return False
         if math.isfinite(face.pitch) and abs(face.pitch) > th.drowsy_max_pitch_deg:
             return False
+        return True
+
+    def _yawn_open(self, face: FaceObservation) -> bool:
+        """A real open mouth, not a narrow mouth with a high gap ratio.
+
+        Scripted/landmark-free faces have no absolute gap; they fall back to
+        MAR so the analysis stack can still be driven in tests.
+        """
+        th = self.th
+        if not math.isfinite(face.mar) or face.mar < th.yawn_mar:
+            return False
+        gap, height = face.mouth_gap, face.face_height
+        if math.isfinite(gap) and math.isfinite(height) and height > 0:
+            if gap < th.yawn_gap_span * height:
+                return False
         return True
 
     def _track_blink(self, now: float, closed: bool) -> None:
@@ -231,8 +272,10 @@ def cigarette_at_mouth(
         return False
     # A wide-open mouth is a yawn, not a cigarette at the lips. The hand
     # often comes to the mouth during a yawn and the cigarette model can
-    # fire on fingers; ignore boxes while the mouth is wide open.
-    if face.mar >= th.yawn_mar:
+    # fire on fingers; ignore boxes while the mouth is wide open. The bar is
+    # deliberately above the yawn bar: using `yawn_mar` here suppressed real
+    # cigarettes held in a slightly parted mouth.
+    if face.mar >= th.cigarette_max_mouth_mar:
         return False
     span = face.bbox[3] - face.bbox[1]
     if span <= 0:
@@ -240,6 +283,8 @@ def cigarette_at_mouth(
     width = detection.box[2] - detection.box[0]
     height = detection.box[3] - detection.box[1]
     if max(width, height) > th.cigarette_max_size_span * span:
+        return False
+    if min(width, height) > th.cigarette_max_thickness_span * span:
         return False
     if width <= 0 or height <= 0:
         return False
@@ -260,28 +305,59 @@ def cigarette_at_mouth(
     return math.hypot(dx, dy) <= th.cigarette_mouth_pad_span * span
 
 
-def phone_near_face(
+def _phone_shape_ok(
     detection: Detection, face: FaceObservation, th: Thresholds
 ) -> bool:
-    """Phone box in the face/upper-chest region, i.e. being held."""
+    """Size and aspect gate shared by both phone anchors.
+
+    A real handset is large against the face and elongated. The COCO model
+    invents phone boxes on cigarettes, fingers, hands and cheeks; those are
+    small, round, or both.
+    """
     if face.bbox is None:
         return False
-    x1, y1, x2, y2 = face.bbox
-    span = y2 - y1
+    span = face.bbox[3] - face.bbox[1]
     if span <= 0:
         return False
-    cx, cy = detection.center
     width = detection.box[2] - detection.box[0]
     height = detection.box[3] - detection.box[1]
+    if width <= 0 or height <= 0:
+        return False
+    long_side = max(width, height)
+    short_side = min(width, height)
     # A full-frame box is a model failure, not a phone in the hand.
-    if max(width, height) > th.phone_max_size_span * span:
+    if long_side > th.phone_max_size_span * span:
         return False
     # A cigarette-sized box is not a phone. The COCO model frequently
     # relabels a cigarette/hand as a phone; those boxes are much smaller
     # than a real handset (live Pi: cigarette ~0.23-0.31 face-heights,
     # real phone at the ear ~0.73).
-    if max(width, height) < th.phone_min_size_span * span:
+    if long_side < th.phone_min_size_span * span:
         return False
+    aspect = long_side / short_side
+    if aspect < th.phone_min_aspect:
+        return False
+    if th.phone_max_aspect > 0 and aspect > th.phone_max_aspect:
+        return False
+    return True
+
+
+def phone_near_face(
+    detection: Detection, face: FaceObservation, th: Thresholds
+) -> bool:
+    """Phone box in the face/upper-chest region, i.e. being held."""
+    if not _phone_shape_ok(detection, face, th):
+        return False
+    x1, y1, x2, y2 = face.bbox
+    span = y2 - y1
+    cx, cy = detection.center
+    # A phone-sized box centred on the face is a hand, cheek or cigarette
+    # mislabelled by the COCO model. Real phones in use sit beside the face
+    # or below the chin.
+    if th.phone_center_exclusion_span > 0 and y1 <= cy <= y2:
+        face_cx = (x1 + x2) / 2.0
+        if abs(cx - face_cx) < th.phone_center_exclusion_span * span:
+            return False
     return (
         x1 - th.phone_face_margin_span * span <= cx <= x2 + th.phone_face_margin_span * span
         and y1 - 0.40 * span <= cy <= y2 + 1.0 * span
@@ -291,23 +367,47 @@ def phone_near_face(
 def phone_at_ear(
     detection: Detection, face: FaceObservation, th: Thresholds
 ) -> bool:
+    if not _phone_shape_ok(detection, face, th):
+        return False
     anchor = mouth_anchor(face)
     if anchor is None:
         return False
     mx, my, span = anchor
     if span <= 0:
         return False
-    width = detection.box[2] - detection.box[0]
-    height = detection.box[3] - detection.box[1]
-    if max(width, height) > th.phone_max_size_span * span:
-        return False
-    if max(width, height) < th.phone_min_size_span * span:
-        return False
     cx, cy = detection.center
     for ear_x in (mx - 0.45 * span, mx + 0.45 * span):
         if abs(cx - ear_x) <= 0.35 * span and abs(cy - (my - 0.25 * span)) <= 0.35 * span:
             return True
     return False
+
+
+class _PassCounter:
+    """Count distinct detector passes while one candidate object persists.
+
+    The detector result is republished unchanged until the next forward pass,
+    so the frame loop sees one box many times. Counting pass ids makes a
+    "two consecutive detector passes" rule real instead of a time rule that
+    one stale result satisfies by itself.
+    """
+
+    def __init__(self) -> None:
+        self._ids: set[int] = set()
+
+    def reset(self) -> None:
+        self._ids.clear()
+
+    def update(self, detections: list[Detection]) -> None:
+        self._ids |= {d.pass_id for d in detections if d.pass_id > 0}
+
+    @property
+    def count(self) -> int:
+        return len(self._ids)
+
+    @property
+    def stamped(self) -> bool:
+        """True once a real pass id was seen; scripted detections have 0."""
+        return bool(self._ids)
 
 
 class SmokingMonitor:
@@ -340,6 +440,8 @@ class SmokingMonitor:
             hold_s=thresholds.cigarette_hold_s,
             bridge_s=thresholds.cigarette_bridge_s,
         )
+        self._passes = _PassCounter()
+        self._announced = False
 
     def candidate(self, detection: Detection, face: FaceObservation) -> bool:
         """A box plausible enough to be drawn in the preview as a cigarette."""
@@ -357,6 +459,10 @@ class SmokingMonitor:
         cigs = [
             d for d in detections if d.label == "cigarette" and self._near_face(d, face)
         ]
+        if cigs:
+            self._passes.update(cigs)
+        else:
+            self._passes.reset()
         # The two bars are independent: a strong box alerts after
         # `cigarette_s`, a weaker box after `cigarette_low_s`. Both hold
         # through a short miss, and the longer elapsed time is reported.
@@ -366,13 +472,25 @@ class SmokingMonitor:
         weak = self._weak.update(
             now, any(d.confidence >= self.th.cigarette_low_conf for d in cigs)
         )
+        # A single result republished across frames is not evidence of a
+        # cigarette. Scripted detections carry pass_id 0, so tests and
+        # landmark-free sources keep the time-only behaviour. The pass bar
+        # gates the onset only: once a real smoking alert is announced, a
+        # brief miss is bridged by the ordinary hold instead of cutting it.
+        enough_passes = (
+            not self._passes.stamped
+            or self._passes.count >= max(1, int(self.th.cigarette_min_passes))
+            or self._announced
+        )
         elapsed = max(self._strong.elapsed(now), self._weak.elapsed(now))
+        active = (strong or weak) and enough_passes
+        self._announced = active
         return [
             ConditionSignal(
                 "smoking",
                 Severity.MAJOR,
                 f"Cigarette at face for {elapsed:.1f}s",
-                strong or weak,
+                active,
             )
         ]
 
@@ -499,6 +617,9 @@ class DistractionMonitor:
         self._in_hand = Sustained(
             thresholds.phone_in_hand_s, hold_s=thresholds.phone_hold_s
         )
+        self._passes = _PassCounter()
+        self._phone_in_use = False
+        self._announced = False
         self._neutral_yaw = 0.0
         self._neutral_pitch = 0.0
         self._calib_start: float | None = None
@@ -513,6 +634,16 @@ class DistractionMonitor:
     @property
     def neutral_pose(self) -> tuple[float, float]:
         return self._neutral_yaw, self._neutral_pitch
+
+    @property
+    def phone_in_use(self) -> bool:
+        """A valid handset is at the ear or in the face/chest gate right now.
+
+        This is the instantaneous geometry result, not the delayed alert, so
+        the drowsiness monitor stops banking eye-closure evidence as soon as
+        the driver raises the phone.
+        """
+        return self._phone_in_use
 
     def _calibrate(self, now: float, face: FaceObservation) -> tuple[float, float] | None:
         """The driver's own forward pose, learned over the first seconds.
@@ -569,10 +700,27 @@ class DistractionMonitor:
         # A phone on the seat stays out.
         phone_in_hand = any(self._near_face(d, face) for d in held_phones)
         phone_at_ear = any(self._at_ear(d, face) for d in phones)
+        held = [
+            d
+            for d in phones
+            if self._at_ear(d, face)
+            or (d.confidence >= th.phone_hand_conf and self._near_face(d, face))
+        ]
+        if held:
+            self._passes.update(held)
+        else:
+            self._passes.reset()
+        self._phone_in_use = bool(held)
+        passes_ok = (
+            not self._passes.stamped
+            or self._passes.count >= max(1, int(th.phone_min_passes))
+            or self._announced
+        )
 
         away = self._away.update(now, looking_away)
-        call_active = self._call.update(now, phone_at_ear)
-        in_hand_active = self._in_hand.update(now, phone_in_hand)
+        call_active = self._call.update(now, phone_at_ear) and passes_ok
+        in_hand_active = self._in_hand.update(now, phone_in_hand) and passes_ok
+        self._announced = call_active or in_hand_active
 
         if (call_active or in_hand_active) and away:
             phone_signal = ConditionSignal(
@@ -678,6 +826,19 @@ def resolve_cigarette_phone_conflicts(
             if _cigarette_phone_conflict(phone, cigarette, face, th)
         ]
         if not conflicts:
+            continue
+        if _is_large_phone(phone, face, th):
+            # A real handset at the ear is the priority label. Drop only
+            # cigarette boxes lying on that same object (overlap or
+            # containment); a separate cigarette at the lips must still be
+            # able to alert.
+            dropped.update(
+                cigarette
+                for cigarette in conflicts
+                if _iou(phone, cigarette) >= th.phone_cigarette_iou
+                or _box_contains(phone.box, *cigarette.center)
+                or _box_contains(cigarette.box, *phone.center)
+            )
             continue
         # On the Pi, a cigarette-sized box is not a handset no matter how
         # confident the phone model is. Without this veto a 0.60+ false box

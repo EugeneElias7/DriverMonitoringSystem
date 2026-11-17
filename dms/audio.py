@@ -81,7 +81,8 @@ def _pick_tts() -> Callable[[str], None] | None:
             return None
 
         def speak(text: str) -> None:
-            # '' is PowerShell's escape for a literal single quote.
+            # Prefer an Indian English voice (Neerja, Heera, Ravi, ...) when
+            # one is installed; fall back to Zira so alerts never stay silent.
             quoted = text.replace("'", "''")
             subprocess.Popen(
                 [
@@ -91,12 +92,39 @@ def _pick_tts() -> Callable[[str], None] | None:
                     "-Command",
                     "Add-Type -AssemblyName System.Speech; "
                     "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                    "try { $s.SelectVoice('Microsoft Zira Desktop') } catch {}; "
+                    "$v = $s.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo } | "
+                    "Where-Object { $_.Name -match 'Neerja|Heera|Ravi|India|en-IN' } | "
+                    "Select-Object -First 1; "
+                    "if ($v) { try { $s.SelectVoice($v.Name) } catch {} } "
+                    "else { try { $s.SelectVoice('Microsoft Zira Desktop') } catch {} }; "
                     f"$s.Speak('{quoted}')",
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+
+        return speak
+    # Linux: prefer pico2wave (Indian English not available, use en-GB as
+    # closest), then espeak, then flite.
+    if shutil.which("pico2wave"):
+        def speak(text: str) -> None:
+            import tempfile, os
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            try:
+                subprocess.run(
+                    ["pico2wave", "-l", "en-GB", "-w", path, text],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                player = _pick_wav_player("")
+                if player is not None:
+                    player(Path(path))
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
         return speak
     for tool in ("espeak-ng", "espeak"):
@@ -105,12 +133,21 @@ def _pick_tts() -> Callable[[str], None] | None:
 
             def speak(text: str, tool: str = found) -> None:
                 subprocess.Popen(
-                    [tool, "-v", "en+f3", text],
+                    [tool, "-v", "en-in", text],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
 
             return speak
+    if shutil.which("flite"):
+        def speak(text: str) -> None:
+            subprocess.Popen(
+                ["flite", "-t", text],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        return speak
     return None
 
 

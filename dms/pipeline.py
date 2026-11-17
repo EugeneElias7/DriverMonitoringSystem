@@ -246,14 +246,19 @@ class Analyzer:
                 observation.detections, observation.face, self.cfg.thresholds
             )
         signals: list[ConditionSignal] = []
-        signals += self.drowsiness.update(now, observation.face)
+        # Distraction runs first: a handset in use suppresses the eye-closure
+        # evidence that a downward glance would otherwise bank as sleep.
+        distraction = self.distraction.update(
+            now, observation.face, observation.detections
+        )
+        signals += self.drowsiness.update(
+            now, observation.face, self.distraction.phone_in_use
+        )
         signals += self.smoking.update(now, observation.face, observation.detections)
         signals += self.drinking.update(now, observation.face, observation.detections)
         signals += self.eating.update(now, observation.face, observation.detections)
         signals += self.seatbelt.update(now, observation.face, observation.detections)
-        signals += self.distraction.update(
-            now, observation.face, observation.detections
-        )
+        signals += distraction
         self.active_signals = signals
         return self.alerts.update(now, signals)
 

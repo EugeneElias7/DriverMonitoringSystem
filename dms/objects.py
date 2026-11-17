@@ -12,7 +12,7 @@ from __future__ import annotations
 import heapq
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -31,6 +31,10 @@ class Detection:
     confidence: float
     box: tuple[int, int, int, int]  # x1, y1, x2, y2 in source-frame pixels
     source: str = ""
+    # Identifies the detector forward pass that produced the box. A result is
+    # republished unchanged until the next pass, so behaviour monitors use
+    # this to require evidence from more than one real pass.
+    pass_id: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "label", self.label.lower())
@@ -342,6 +346,9 @@ class BackgroundDetector:
         self._lock = threading.Lock()
         self._results: list[Detection] = []
         self._results_seq = 0
+        # Incremented once per real forward pass so consumers can tell a new
+        # result from the same result republished over many frames.
+        self._pass_seq = 0
         # time.monotonic() at which the published results were computed. On a
         # Pi 3 a full pass takes 12-16 s, so boxes can belong to a frame that
         # is long gone; the overlay needs the age to avoid painting them onto
@@ -454,7 +461,11 @@ class BackgroundDetector:
                         self.last_error = None
                     self.last_latency_ms = (time.perf_counter() - started) * 1000.0
                     with self._lock:
-                        self._results = results
+                        self._pass_seq += 1
+                        pass_id = self._pass_seq
+                        self._results = [
+                            replace(result, pass_id=pass_id) for result in results
+                        ]
                         self._results_seq += 1
                         self._results_at = time.monotonic()
             finally:

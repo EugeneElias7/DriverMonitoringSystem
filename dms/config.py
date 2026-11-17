@@ -67,9 +67,14 @@ class Thresholds:
     perclos_window_s: float = 4.0
     perclos_alert: float = 0.35
     microsleep_s: float = 1.2
-    # A real yawn opens the mouth well past speech; 0.55 with a 1.0 s hold
-    # catches it without firing on normal talking or a drag on a cigarette.
+    # A real yawn opens the mouth well past speech. MAR alone is not enough:
+    # a narrow mouth with a small gap can score high, and the Pi's previous
+    # 0.35 bar fired on a closed mouth. The alert needs MAR past `yawn_mar`,
+    # an absolute inner-lip gap of `yawn_gap_span` face heights, and
+    # `yawn_min_frames` consecutive open frames.
     yawn_mar: float = 0.55
+    yawn_gap_span: float = 0.10
+    yawn_min_frames: int = 3
     yawn_s: float = 1.0
     face_missing_s: float = 2.0
     # A hand over the face, a profile view or a landmark glitch produces
@@ -103,6 +108,16 @@ class Thresholds:
     # A weaker box must persist for `cigarette_low_s`.
     cigarette_low_conf: float = 0.45
     cigarette_low_s: float = 1.5
+    # The mouth must be near-closed for a cigarette. A wide-open mouth is a
+    # yawn and the hand comes to the lips; 0.75 is above a normal yawn's
+    # attempt to hold a cigarette, while still allowing a slightly parted
+    # mouth. Replaces the old `yawn_mar` comparison, which was so low on the
+    # Pi that it suppressed real cigarettes.
+    cigarette_max_mouth_mar: float = 0.75
+    # A result is republished until the next detector pass. On a Pi that can
+    # be several seconds of identical boxes, so the alert needs evidence from
+    # this many distinct passes, not one result repeated by the frame loop.
+    cigarette_min_passes: int = 2
     # How far the cigarette box centre may sit from the mouth, in face
     # heights. Real boxes measured on smoking clips land 0.01-0.27 away;
     # hands/phones at the chin land around 0.47-0.57, so 0.30 separates them.
@@ -117,6 +132,11 @@ class Thresholds:
     # 1.16-1.21, so the Pi uses 1.15. Phone false boxes are usually below
     # that or far from the mouth.
     cigarette_min_aspect: float = 1.0
+    # A cigarette is thin in both directions. A hand/fist at the mouth is as
+    # thick as it is long, so capping the short side is what separates a real
+    # cigarette from fingers on the lips. A live Pi cigarette box measured
+    # 37 px on the short side in a 159-px face (0.23). 1.0 disables the check.
+    cigarette_max_thickness_span: float = 1.0
     # The mouth point must lie within this many face heights of the box
     # (zero when the mouth is inside it). A cigarette at the lips overlaps
     # the mouth; a watch on the cheek does not. The default is effectively
@@ -196,6 +216,21 @@ class Thresholds:
     # heights. A phone held in the left/right hand can sit beside the face;
     # 0.55 is tight. The Pi widens it to 0.75.
     phone_face_margin_span: float = 0.55
+    # Handsets are elongated rectangles. A round box (a hand, a watch, the
+    # cheek) is not a phone. The PC leaves the floor at 1.0 so its existing
+    # profile is unchanged; the Pi uses 1.2.
+    phone_min_aspect: float = 1.0
+    # A very long thin box is more likely an arm or a frame artifact. 0
+    # disables the ceiling.
+    phone_max_aspect: float = 4.0
+    # Reject a phone-sized box centred on the face itself: that is a hand,
+    # cheek or cigarette mislabelled by the COCO model. Real phones in use
+    # sit beside the face or below the chin. 0 disables the check.
+    phone_center_exclusion_span: float = 0.0
+    # Phone evidence must come from this many distinct detector passes. On
+    # the Pi one pass is republished for several seconds, which is long
+    # enough to fake "phone in hand" from a single false box.
+    phone_min_passes: int = 1
     # Keep the phone alert on through brief detector misses.
     phone_hold_s: float = 3.0
 

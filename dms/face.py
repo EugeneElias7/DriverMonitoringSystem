@@ -31,6 +31,11 @@ class FaceObservation:
     ear_right: float = math.nan
     ear: float = math.nan
     mar: float = math.nan
+    # Absolute inner-lip opening and landmark face height, in pixels. MAR is
+    # gap / mouth width, so a narrow closed mouth can score high; the yawn
+    # gate uses the gap relative to the face height to reject that.
+    mouth_gap: float = math.nan
+    face_height: float = math.nan
     pitch: float = math.nan
     yaw: float = math.nan
     roll: float = math.nan
@@ -79,6 +84,8 @@ def _observe(
         ear_right=ear_right,
         ear=(ear_left + ear_right) / 2.0,
         mar=geo.mouth_aspect_ratio(points, mouth_lips, mouth_corners),
+        mouth_gap=geo.mouth_gap(points, mouth_lips),
+        face_height=float(y2 - y1),
         pitch=pitch,
         yaw=yaw,
         roll=roll,

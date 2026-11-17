@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 import unittest
@@ -97,7 +98,7 @@ class ConfigTests(unittest.TestCase):
         # A single OpenCV worker keeps the YOLO passes on their own threads
         # instead of queueing behind the face path in a shared pool; with more
         # threads the status loop froze for the whole detector pass.
-        self.assertEqual(pi.opencv_threads, 1)
+        self.assertEqual(pi.opencv_threads, 2)
         # The Pi skips the ~5 s model self-test, but keeps the short startup
         # phrase so the speaker path is proven before an alert is needed.
         self.assertFalse(pi.self_test)
@@ -108,41 +109,55 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(pi.detectors[1].name, "phone")
         self.assertGreaterEqual(pi.detectors[0].target_hz, 0.5)
         self.assertGreaterEqual(pi.detectors[1].target_hz, 0.5)
-        # Sleep must confirm only on a real closure: two consecutive fully
-        # closed samples and a sub-second timer. At ~1 fps a normal blink
-        # occupies one sample, so the status line shows closed=yes run=1/2
-        # and the state stays Attentive.
-        self.assertEqual(pi.thresholds.microsleep_min_frames, 2)
-        self.assertLessEqual(pi.thresholds.microsleep_s, 0.6)
+        # Sleep must confirm only on a real closure: three consecutive fully
+        # closed samples and a sustained timer. The old sub-second bar plus
+        # two frames alarmed on a downward glance at a phone.
+        self.assertGreaterEqual(pi.thresholds.microsleep_min_frames, 2)
+        self.assertGreaterEqual(pi.thresholds.microsleep_s, 0.5)
         self.assertLessEqual(pi.thresholds.ear_closed, 0.20)
+        self.assertLessEqual(pi.thresholds.perclos_min_samples, 6)
+        self.assertGreaterEqual(pi.thresholds.perclos_alert, 0.40)
+        # A yawn needs a high MAR plus a real mouth gap relative to the face,
+        # held over several frames. MAR alone fired on a closed mouth.
+        self.assertGreaterEqual(pi.thresholds.yawn_mar, 0.50)
+        self.assertGreaterEqual(pi.thresholds.yawn_min_frames, 3)
+        self.assertGreaterEqual(pi.thresholds.yawn_gap_span, 0.08)
         # This camera sees the driver at a steep angle; leave headroom above
         # the measured ~53 deg yaw so a valid closed-eye frame is not rejected.
         self.assertGreaterEqual(pi.thresholds.drowsy_max_yaw_deg, 80.0)
-        # Phone should stay sensitive; the Pi only gets one pass every few
-        # seconds, so the low-confidence gates cannot be too strict.
-        self.assertLessEqual(pi.thresholds.phone_call_s, 0.6)
-        self.assertLessEqual(pi.thresholds.phone_in_hand_s, 0.6)
+        # Phone alerts wait for a real handset-sized, elongated box in two
+        # separate detector passes; one republished false box cannot alert.
+        self.assertGreaterEqual(pi.thresholds.phone_call_s, 1.0)
+        self.assertGreaterEqual(pi.thresholds.phone_in_hand_s, 2.0)
         self.assertLessEqual(pi.thresholds.phone_low_conf, 0.3)
         self.assertLessEqual(pi.thresholds.phone_hand_conf, 0.35)
-        self.assertGreaterEqual(pi.thresholds.phone_max_size_span, 1.4)
+        self.assertGreaterEqual(pi.thresholds.phone_min_size_span, 0.4)
+        self.assertGreaterEqual(pi.thresholds.phone_max_size_span, 1.1)
+        self.assertGreater(pi.thresholds.phone_min_aspect, 1.0)
         self.assertGreaterEqual(pi.thresholds.phone_face_margin_span, 0.7)
-        # The Pi republishes one detector result until the next ~6 s pass, so
-        # the onset bars mostly add latency after a pass rather than filtering
-        # short flickers. Geometry and confidence do the filtering. Keep the
-        # bars short so the alert follows the pass by one face frame.
-        self.assertLessEqual(pi.thresholds.cigarette_s, 0.4)
-        self.assertGreaterEqual(pi.thresholds.cigarette_low_s, 0.5)
-        # A real cigarette scores 0.27-0.80 on this camera. The detector and
-        # alert floors are low (0.25) so a weak box still triggers; the high
-        # path at 0.50 confirms in 0.3 s and the weak path in 0.6 s.
+        self.assertGreaterEqual(pi.thresholds.phone_min_passes, 1)
+        # A cigarette must hold at the mouth for a real time span and appear
+        # in two passes. The mouth-open rejection is above the yawn bar so a
+        # slightly parted mouth does not hide a real cigarette.
+        self.assertGreaterEqual(pi.thresholds.cigarette_s, 1.0)
+        self.assertGreaterEqual(
+            pi.thresholds.cigarette_low_s, pi.thresholds.cigarette_s
+        )
         self.assertLessEqual(pi.detectors[0].conf_threshold, 0.3)
         self.assertGreaterEqual(pi.thresholds.cigarette_low_conf, 0.20)
         self.assertLessEqual(pi.thresholds.cigarette_low_conf, 0.35)
         self.assertGreaterEqual(pi.thresholds.cigarette_high_conf, 0.45)
-        self.assertLessEqual(pi.thresholds.cigarette_high_conf, 0.55)
+        self.assertLessEqual(pi.thresholds.cigarette_high_conf, 0.65)
         self.assertGreater(
             pi.thresholds.cigarette_high_conf, pi.thresholds.cigarette_low_conf
         )
+        self.assertGreaterEqual(pi.thresholds.cigarette_min_passes, 2)
+        self.assertGreater(
+            pi.thresholds.cigarette_max_mouth_mar, pi.thresholds.yawn_mar
+        )
+        self.assertLessEqual(pi.thresholds.cigarette_max_size_span, 0.60)
+        self.assertLessEqual(pi.thresholds.cigarette_max_thickness_span, 0.40)
+        self.assertLessEqual(pi.thresholds.cigarette_mouth_pad_span, 0.25)
         self.assertLessEqual(pi.thresholds.cigarette_min_aspect, 1.25)
         self.assertGreaterEqual(pi.thresholds.cigarette_bridge_s, 0.5)
 
@@ -173,6 +188,8 @@ class DrowsinessTests(unittest.TestCase):
         mar: float = 0.05,
         ear_left: float | None = None,
         ear_right: float | None = None,
+        mouth_gap: float = math.nan,
+        face_height: float = math.nan,
     ) -> FaceObservation:
         return FaceObservation(
             present=True,
@@ -182,6 +199,8 @@ class DrowsinessTests(unittest.TestCase):
             ear_left=ear if ear_left is None else ear_left,
             ear_right=ear if ear_right is None else ear_right,
             mar=mar,
+            mouth_gap=mouth_gap,
+            face_height=face_height,
             yaw=5.0,
             pitch=5.0,
         )
@@ -284,6 +303,44 @@ class DrowsinessTests(unittest.TestCase):
             self._active(monitor.update(0.8, self._face(ear=0.30)), "drowsy_microsleep")
         )
 
+    def test_closed_mouth_with_high_mar_is_not_a_yawn(self) -> None:
+        # A narrow, closed mouth can make MAR look high. The absolute lip gap
+        # is only 3 px on a 120 px face, so this is not a yawn.
+        monitor = DrowsinessMonitor(
+            Thresholds(yawn_mar=0.35, yawn_s=0.0, yawn_min_frames=1)
+        )
+        for t in (0.0, 1.0, 2.0, 3.0):
+            signals = monitor.update(
+                t,
+                self._face(mar=0.70, mouth_gap=3.0, face_height=120.0),
+            )
+            self.assertFalse(self._active(signals, "drowsy_yawning"))
+
+    def test_real_yawn_needs_mouth_gap_and_frames(self) -> None:
+        monitor = DrowsinessMonitor(
+            Thresholds(yawn_mar=0.55, yawn_s=0.0, yawn_min_frames=3)
+        )
+        face = self._face(mar=0.70, mouth_gap=20.0, face_height=120.0)
+        self.assertFalse(self._active(monitor.update(0.0, face), "drowsy_yawning"))
+        self.assertFalse(self._active(monitor.update(1.0, face), "drowsy_yawning"))
+        self.assertTrue(self._active(monitor.update(2.0, face), "drowsy_yawning"))
+
+    def test_phone_in_use_resets_sleep_evidence(self) -> None:
+        monitor = DrowsinessMonitor(
+            Thresholds(microsleep_s=0.1, microsleep_min_frames=2)
+        )
+        closed = self._face(ear=0.05)
+        for t in (0.0, 1.0, 2.0):
+            signals = monitor.update(t, closed, phone_in_use=True)
+            self.assertFalse(self._active(signals, "drowsy_microsleep"))
+        # The banked closure is discarded; a new run needs its own frames.
+        self.assertFalse(
+            self._active(monitor.update(3.0, closed), "drowsy_microsleep")
+        )
+        self.assertTrue(
+            self._active(monitor.update(4.0, closed), "drowsy_microsleep")
+        )
+
 
 class GateTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -366,6 +423,20 @@ class GateTests(unittest.TestCase):
         self.assertTrue(gate._near_face(end_on, self.face))
         self.assertFalse(gate._near_face(round_box, self.face))
 
+    def test_hand_sized_cigarette_box_at_mouth_is_rejected(self):
+        # A hand at the lips is as thick as it is long. A real cigarette box
+        # is thin on its short side (live Pi: 37 px in a 159-px face).
+        gate = SmokingMonitor(
+            Thresholds(
+                cigarette_max_thickness_span=0.35,
+                cigarette_mouth_pad_span=0.20,
+            )
+        )
+        hand = Detection("cigarette", 0.8, (120, 155, 175, 200))
+        thin = Detection("cigarette", 0.8, (140, 175, 165, 190))
+        self.assertFalse(gate._near_face(hand, self.face))
+        self.assertTrue(gate._near_face(thin, self.face))
+
     def test_cigarette_wins_over_weak_phone_at_ear(self):
         cigarette = Detection("cigarette", 0.58, (140, 175, 183, 212))
         phone = Detection("cell phone", 0.46, (172, 120, 212, 180))
@@ -373,6 +444,26 @@ class GateTests(unittest.TestCase):
             [cigarette, phone], self.face, Thresholds()
         )
         self.assertEqual([d.label for d in kept], ["cigarette"])
+
+    def test_cigarette_box_on_an_ear_phone_is_dropped(self):
+        # The dedicated cigarette model can fire on the handset/hand at the
+        # ear. The phone label wins on that object, so it can never become a
+        # smoking alert.
+        th = Thresholds(
+            phone_min_size_span=0.50,
+            phone_min_aspect=1.20,
+            phone_max_aspect=3.5,
+            phone_strong_size_span=0.55,
+            cigarette_mouth_pad_span=0.20,
+        )
+        phone = Detection("cell phone", 0.62, (60, 130, 120, 215))
+        on_phone = Detection("cigarette", 0.80, (105, 165, 140, 205))
+        kept = resolve_cigarette_phone_conflicts([on_phone, phone], self.face, th)
+        self.assertEqual([d.label for d in kept], ["cell phone"])
+        # A real cigarette at the lips does not overlap the phone and is kept.
+        at_lips = Detection("cigarette", 0.80, (140, 175, 165, 195))
+        kept = resolve_cigarette_phone_conflicts([at_lips, phone], self.face, th)
+        self.assertEqual([d.label for d in kept], ["cigarette", "cell phone"])
 
     def test_large_real_handset_at_ear_survives_cigarette_arbitration(self):
         # Live Pi real phone: 48x116 in a 159-pixel face (0.73 face-heights,
@@ -509,6 +600,136 @@ class GateTests(unittest.TestCase):
         self.assertFalse(next(s.active for s in first if s.key == "phone_use"))
         second = gate.update(0.6, self.face, [phone])
         self.assertTrue(next(s.active for s in second if s.key == "phone_use"))
+
+    def test_phone_gate_rejects_a_box_centred_on_the_face(self):
+        gate = DistractionMonitor(
+            Thresholds(
+                phone_min_size_span=0.50,
+                phone_min_aspect=1.20,
+                phone_center_exclusion_span=0.30,
+            )
+        )
+        # Large and elongated enough, but centred on the face: the hand/cheek
+        # shape that caused the false phone alert while the driver was drowsy.
+        on_face = Detection("cell phone", 0.70, (115, 150, 185, 200))
+        self.assertFalse(gate._near_face(on_face, self.face))
+        # A handset at the ear is offset from the face centre and still passes.
+        at_ear = Detection("cell phone", 0.54, (60, 130, 120, 215))
+        self.assertTrue(gate._near_face(at_ear, self.face))
+
+    def test_round_phone_box_is_rejected(self):
+        gate = DistractionMonitor(
+            Thresholds(phone_min_size_span=0.50, phone_min_aspect=1.20)
+        )
+        round_box = Detection("cell phone", 0.9, (110, 140, 190, 220))
+        self.assertFalse(gate._near_face(round_box, self.face))
+
+    def test_phone_needs_two_distinct_detector_passes(self):
+        gate = DistractionMonitor(
+            Thresholds(
+                phone_in_hand_s=0.5,
+                phone_hold_s=0.0,
+                phone_hand_conf=0.3,
+                phone_low_conf=0.25,
+                phone_min_size_span=0.50,
+                phone_min_aspect=1.20,
+                phone_max_aspect=3.5,
+                phone_center_exclusion_span=0.30,
+                phone_min_passes=2,
+            )
+        )
+        phone_pass_1 = Detection("cell phone", 0.62, (10, 150, 105, 275), pass_id=1)
+        for t in (0.0, 1.0, 2.0):
+            signals = gate.update(t, self.face, [phone_pass_1])
+            self.assertFalse(next(s.active for s in signals if s.key == "phone_use"))
+        phone_pass_2 = Detection("cell phone", 0.62, (10, 150, 105, 275), pass_id=2)
+        signals = gate.update(3.0, self.face, [phone_pass_2])
+        self.assertTrue(next(s.active for s in signals if s.key == "phone_use"))
+
+    def test_phone_in_use_flag_is_instant_geometry(self):
+        gate = DistractionMonitor(
+            Thresholds(
+                phone_in_hand_s=100.0,
+                phone_hand_conf=0.3,
+                phone_low_conf=0.25,
+                phone_min_size_span=0.50,
+                phone_min_aspect=1.20,
+                phone_max_aspect=3.5,
+                phone_center_exclusion_span=0.30,
+            )
+        )
+        phone = Detection("cell phone", 0.62, (10, 150, 105, 275))
+        gate.update(0.0, self.face, [phone])
+        self.assertTrue(gate.phone_in_use)
+        gate.update(0.5, self.face, [])
+        self.assertFalse(gate.phone_in_use)
+
+    def test_cigarette_needs_two_distinct_detector_passes(self):
+        gate = SmokingMonitor(
+            Thresholds(
+                cigarette_s=0.1,
+                cigarette_low_s=0.1,
+                cigarette_high_conf=0.6,
+                cigarette_low_conf=0.25,
+                cigarette_min_passes=2,
+            )
+        )
+        cigarette = Detection("cigarette", 0.8, (145, 170, 165, 195), pass_id=1)
+        for t in (0.0, 1.0, 2.0):
+            self.assertFalse(gate.update(t, self.face, [cigarette])[0].active)
+        next_pass = Detection("cigarette", 0.8, (145, 170, 165, 195), pass_id=2)
+        self.assertTrue(gate.update(3.0, self.face, [next_pass])[0].active)
+
+    def test_phone_alert_survives_a_missed_pass_after_onset(self):
+        gate = DistractionMonitor(
+            Thresholds(
+                phone_in_hand_s=0.5,
+                phone_hold_s=3.0,
+                phone_hand_conf=0.3,
+                phone_low_conf=0.25,
+                phone_min_size_span=0.55,
+                phone_min_aspect=1.20,
+                phone_max_aspect=3.5,
+                phone_center_exclusion_span=0.30,
+                phone_min_passes=2,
+            )
+        )
+        phone_pass_1 = Detection("cell phone", 0.62, (10, 150, 105, 275), pass_id=1)
+        phone_pass_2 = Detection("cell phone", 0.62, (10, 150, 105, 275), pass_id=2)
+        gate.update(0.0, self.face, [phone_pass_1])
+        gate.update(1.0, self.face, [phone_pass_2])
+        signals = gate.update(2.0, self.face, [])
+        self.assertTrue(next(s.active for s in signals if s.key == "phone_use"))
+
+    def test_cigarette_alert_survives_a_short_miss_after_onset(self):
+        gate = SmokingMonitor(
+            Thresholds(
+                cigarette_s=0.1,
+                cigarette_low_s=0.1,
+                cigarette_high_conf=0.6,
+                cigarette_low_conf=0.25,
+                cigarette_hold_s=2.0,
+                cigarette_min_passes=2,
+            )
+        )
+        pass_1 = Detection("cigarette", 0.8, (145, 170, 165, 195), pass_id=1)
+        pass_2 = Detection("cigarette", 0.8, (145, 170, 165, 195), pass_id=2)
+        gate.update(0.0, self.face, [pass_1])
+        self.assertTrue(gate.update(1.0, self.face, [pass_2])[0].active)
+        self.assertTrue(gate.update(2.0, self.face, [])[0].active)
+
+    def test_cigarette_gate_allows_a_slightly_parted_mouth(self):
+        # The old mouth-open rejection reused the 0.35 yawn bar and hid real
+        # cigarettes. 0.60 is open but below cigarette_max_mouth_mar.
+        gate = SmokingMonitor(Thresholds())
+        face = FaceObservation(
+            present=True,
+            bbox=(100.0, 100.0, 200.0, 220.0),
+            mouth=(150.0, 180.0),
+            mar=0.60,
+        )
+        cigarette = Detection("cigarette", 0.9, (145, 170, 165, 195))
+        self.assertTrue(gate._near_face(cigarette, face))
 
 
 class DetectorSchedulingTests(unittest.TestCase):

@@ -116,6 +116,8 @@ class OnnxFaceAnalyzer(OpenCvFaceAnalyzer):
             ear_right=float(ear_right),
             ear=float((ear_left + ear_right) / 2.0),
             mar=float(geo.mouth_aspect_ratio(points, self.MOUTH_LIPS, self.MOUTH_CORNERS)),
+            mouth_gap=float(geo.mouth_gap(points, self.MOUTH_LIPS)),
+            face_height=float(y_max - y_min),
             pitch=float(pitch),
             yaw=float(yaw),
             roll=float(roll),

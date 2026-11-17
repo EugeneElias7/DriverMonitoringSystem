@@ -222,11 +222,22 @@ def _status_line(
     # different from a microsleep. Capping at `need` keeps a long closure
     # readable as run=2/2 rather than run=62/2.
     closed_text += f" run={run}/{need}"
+    # Yawn calibration: `gap` is the inner-lip opening in pixels and `gapH`
+    # is that opening relative to the landmark face height. A closed mouth
+    # sits near 0.01-0.03 even when MAR is misleading.
+    gap_ratio = (
+        face.mouth_gap / face.face_height
+        if math.isfinite(face.mouth_gap)
+        and math.isfinite(face.face_height)
+        and face.face_height > 0
+        else math.nan
+    )
     parts = [
         f"[status] t={observation.timestamp:6.1f}s fps={fps:4.1f}",
         f"state={state_text.replace(' - ', ': ')}",
         f"face={'yes' if face.present else 'no':>3}",
         f"ear={face.ear:5.3f} mar={face.mar:5.3f}",
+        f"gap={face.mouth_gap:4.0f} gapH={gap_ratio:4.2f}",
         f"closed={closed_text} reliable={'yes' if analyzer.drowsiness.last_reliable else 'no'}",
         f"yaw={face.yaw:6.1f} pitch={face.pitch:6.1f} roll={face.roll:6.1f}",
         ref,
@@ -641,9 +652,15 @@ def run(
                 # Eyes closed or no face: stop starting YOLO passes and give
                 # the CPU to the next face frame. A pass already in flight
                 # finishes, but the next one waits until the face is back.
+                # Exception: a phone already in use keeps the detectors
+                # running so a call can confirm while the eyes are shut; the
+                # phone alert, not a false microsleep, owns that state.
                 perception.set_detectors_paused(
                     not observation.face.present
-                    or analyzer.drowsiness.eyes_closed
+                    or (
+                        analyzer.drowsiness.eyes_closed
+                        and not analyzer.distraction.phone_in_use
+                    )
                 )
             frame_count += 1
 
