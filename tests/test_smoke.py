@@ -156,7 +156,7 @@ class ConfigTests(unittest.TestCase):
             pi.thresholds.cigarette_max_mouth_mar, pi.thresholds.yawn_mar
         )
         self.assertLessEqual(pi.thresholds.cigarette_max_size_span, 0.60)
-        self.assertLessEqual(pi.thresholds.cigarette_max_thickness_span, 0.40)
+        self.assertLessEqual(pi.thresholds.cigarette_max_thickness_span, 0.25)
         self.assertLessEqual(pi.thresholds.cigarette_mouth_pad_span, 0.25)
         self.assertLessEqual(pi.thresholds.cigarette_min_aspect, 1.25)
         self.assertGreaterEqual(pi.thresholds.cigarette_bridge_s, 0.5)
